@@ -16,6 +16,11 @@ Exactly one of the two must be set.
 that the control plane authorized. ``AUTOGLM_CONTROL_PLANE_URL`` is where the
 runtime reaches the control plane's internal API.
 
+The control plane may put the phone to sleep while the runtime is idle. Before
+the runtime uses the phone (tasks, scheduled tasks, the live stream) it calls
+:func:`ensure_device_awake`, which asks the control plane to wake the phone and
+reconnects to it; a heartbeat tells the control plane when the runtime is busy.
+
 Managed mode is off by default; nothing here changes the behaviour of a normal
 local installation.
 """
@@ -24,9 +29,12 @@ from __future__ import annotations
 
 import asyncio
 import os
-from collections.abc import Mapping
+import time
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+
+import httpx
 
 from AutoGLM_GUI.logger import logger
 
@@ -39,6 +47,13 @@ MIN_INTERNAL_TOKEN_LENGTH = 16
 DEFAULT_REMOTE_DEVICE_ID = "managed-device"
 DEFAULT_BIND_ATTEMPTS = 15
 DEFAULT_BIND_RETRY_DELAY = 2.0
+
+# Waking a phone can include a cold boot.
+DEFAULT_WAKE_TIMEOUT = 240.0
+# The control plane sleeps phones only after minutes of inactivity, and every
+# wake counts as activity, so a wake is still valid for a short while.
+WAKE_DEBOUNCE_SECONDS = 30.0
+HEARTBEAT_INTERVAL_SECONDS = 30.0
 
 
 @dataclass(frozen=True)
@@ -178,3 +193,182 @@ async def _try_bind(
         existing = f"remote:{settings.device_remote_url}:{settings.device_remote_id}"
         return True, message, existing
     return ok, message, serial if ok else None
+
+
+# --------------------------------------------------------------------------- wake
+
+
+class ManagedWakeError(RuntimeError):
+    """The phone could not be woken or reconnected."""
+
+
+class ControlPlaneClient:
+    """Calls the control plane's internal runtime API with the runtime token."""
+
+    def __init__(
+        self,
+        base_url: str,
+        token: str,
+        *,
+        wake_timeout: float = DEFAULT_WAKE_TIMEOUT,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        self._client = httpx.AsyncClient(
+            base_url=base_url.rstrip("/"),
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10.0,
+            transport=transport,
+        )
+        self._wake_timeout = wake_timeout
+
+    async def wake(self) -> None:
+        """Block until the control plane reports the phone running."""
+        try:
+            resp = await self._client.post(
+                "/internal/runtime/wake", timeout=self._wake_timeout
+            )
+        except httpx.HTTPError as exc:
+            raise ManagedWakeError(f"control plane unreachable: {exc}") from exc
+        if resp.status_code >= 400:
+            raise ManagedWakeError(
+                f"wake failed: HTTP {resp.status_code}: {resp.text[:200]}"
+            )
+
+    async def report_activity(self, *, busy: bool, viewers: int) -> None:
+        """Best effort: a missed heartbeat only makes an idle sleep more likely."""
+        try:
+            resp = await self._client.post(
+                "/internal/runtime/activity",
+                json={"busy": busy, "viewers": viewers},
+                timeout=5.0,
+            )
+            if resp.status_code >= 400:
+                logger.warning(
+                    f"[Managed] Activity report rejected: {resp.status_code}"
+                )
+        except httpx.HTTPError as exc:
+            logger.warning(f"[Managed] Activity report failed: {exc}")
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+
+class ManagedRuntime:
+    """Keeps the managed phone awake while the runtime needs it."""
+
+    def __init__(
+        self,
+        settings: ManagedSettings,
+        device_manager: DeviceManager,
+        client: ControlPlaneClient,
+        *,
+        adb_path: str = "adb",
+        debounce_seconds: float = WAKE_DEBOUNCE_SECONDS,
+        rebind_attempts: int = 10,
+        rebind_delay: float = 1.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._settings = settings
+        self._device_manager = device_manager
+        self.client = client
+        self._adb_path = adb_path
+        self._debounce = debounce_seconds
+        self._rebind_attempts = rebind_attempts
+        self._rebind_delay = rebind_delay
+        self._clock = clock
+        self._lock = asyncio.Lock()
+        self._last_wake: float | None = None
+
+    def woke_within(self, seconds: float) -> bool:
+        return self._last_wake is not None and self._clock() - self._last_wake < seconds
+
+    async def ensure_device_awake(self) -> None:
+        async with self._lock:
+            if self.woke_within(self._debounce):
+                return
+            await self.client.wake()
+            # The ADB TCP connection drops while the phone sleeps; reconnect.
+            serial = await bind_managed_device(
+                self._device_manager,
+                self._settings,
+                adb_path=self._adb_path,
+                attempts=self._rebind_attempts,
+                retry_delay=self._rebind_delay,
+            )
+            if serial is None:
+                raise ManagedWakeError(
+                    "phone is awake but the runtime could not reconnect"
+                )
+            self._last_wake = self._clock()
+
+    async def heartbeat_once(
+        self,
+        busy_probe: Callable[[], Awaitable[bool]],
+        viewers_probe: Callable[[], int],
+    ) -> None:
+        busy = await busy_probe() or self.woke_within(HEARTBEAT_INTERVAL_SECONDS)
+        await self.client.report_activity(busy=busy, viewers=viewers_probe())
+
+    async def heartbeat_loop(
+        self,
+        busy_probe: Callable[[], Awaitable[bool]],
+        viewers_probe: Callable[[], int],
+        interval: float = HEARTBEAT_INTERVAL_SECONDS,
+    ) -> None:
+        while True:
+            try:
+                await self.heartbeat_once(busy_probe, viewers_probe)
+            except Exception:
+                logger.exception("[Managed] Heartbeat failed")
+            await asyncio.sleep(interval)
+
+
+_managed_runtime: ManagedRuntime | None = None
+
+
+def set_managed_runtime(runtime: ManagedRuntime | None) -> None:
+    global _managed_runtime
+    _managed_runtime = runtime
+
+
+def get_managed_runtime() -> ManagedRuntime | None:
+    return _managed_runtime
+
+
+def start_managed_runtime(
+    settings: ManagedSettings, device_manager: DeviceManager, adb_path: str
+) -> ManagedRuntime | None:
+    """Create and register the process-wide ManagedRuntime.
+
+    Without ``AUTOGLM_CONTROL_PLANE_URL`` the phone is never put to sleep by a
+    control plane we can reach, so wake-on-demand stays off.
+    """
+    if not settings.enabled or not settings.control_plane_url:
+        if settings.enabled:
+            logger.warning(
+                "[Managed] AUTOGLM_CONTROL_PLANE_URL not set; wake-on-demand is off"
+            )
+        return None
+    runtime = ManagedRuntime(
+        settings,
+        device_manager,
+        ControlPlaneClient(settings.control_plane_url, settings.internal_token or ""),
+        adb_path=adb_path,
+    )
+    set_managed_runtime(runtime)
+    return runtime
+
+
+async def ensure_device_awake() -> None:
+    """Wake the managed phone before using it. No-op outside managed mode.
+
+    Failures are logged, not raised: the phone may well be awake already, and a
+    phone that is really unreachable fails the caller with its usual device error.
+    """
+    runtime = _managed_runtime
+    if runtime is None:
+        return
+    try:
+        await runtime.ensure_device_awake()
+    except ManagedWakeError as exc:
+        logger.error(f"[Managed] {exc}")

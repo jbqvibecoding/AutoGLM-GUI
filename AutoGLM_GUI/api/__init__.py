@@ -21,7 +21,13 @@ from starlette.types import Scope
 
 from AutoGLM_GUI.adb_plus.qr_pair import qr_pairing_manager
 from AutoGLM_GUI.logger import logger
-from AutoGLM_GUI.managed import bind_managed_device, load_managed_settings
+from AutoGLM_GUI.managed import (
+    ManagedRuntime,
+    bind_managed_device,
+    load_managed_settings,
+    set_managed_runtime,
+    start_managed_runtime,
+)
 from AutoGLM_GUI.version import APP_VERSION
 
 from . import (
@@ -162,7 +168,9 @@ def create_app() -> FastAPI:
         asyncio.create_task(qr_pairing_manager.cleanup_expired_sessions())
 
         from AutoGLM_GUI.device_manager import DeviceManager
+        from AutoGLM_GUI.phone_agent_manager import PhoneAgentManager
         from AutoGLM_GUI.scheduler_manager import scheduler_manager
+        from AutoGLM_GUI.socketio_server import active_stream_count
         from AutoGLM_GUI.task_manager import task_manager
 
         # Managed mode: bind the single device provisioned by the control plane.
@@ -174,10 +182,22 @@ def create_app() -> FastAPI:
         device_manager.start_polling()
 
         managed_bind_task: asyncio.Task[str | None] | None = None
+        managed_heartbeat_task: asyncio.Task[None] | None = None
+        managed_runtime: ManagedRuntime | None = None
         if managed_settings.enabled:
             managed_bind_task = asyncio.create_task(
                 bind_managed_device(device_manager, managed_settings, adb_path=adb_path)
             )
+            managed_runtime = start_managed_runtime(
+                managed_settings, device_manager, adb_path
+            )
+            if managed_runtime is not None:
+                managed_heartbeat_task = asyncio.create_task(
+                    managed_runtime.heartbeat_loop(
+                        PhoneAgentManager.get_instance().has_busy_agent_async,
+                        active_stream_count,
+                    )
+                )
 
         await task_manager.start()
         # Start scheduled task scheduler
@@ -188,8 +208,12 @@ def create_app() -> FastAPI:
             yield
 
         # App shutdown
-        if managed_bind_task is not None and not managed_bind_task.done():
-            managed_bind_task.cancel()
+        for task in (managed_bind_task, managed_heartbeat_task):
+            if task is not None and not task.done():
+                task.cancel()
+        if managed_runtime is not None:
+            set_managed_runtime(None)
+            await managed_runtime.client.aclose()
         await scheduler_manager.shutdown()
         await task_manager.shutdown()
 

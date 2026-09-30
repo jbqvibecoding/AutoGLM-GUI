@@ -196,7 +196,11 @@ class SchedulerManager:
         device_manager: Any,
         history_manager: Any,
     ) -> DeviceExecutionResult:
+        from AutoGLM_GUI.managed import ensure_device_awake
         from AutoGLM_GUI.models.history import ConversationRecord, MessageRecord
+
+        # Managed mode: a sleeping phone is offline until woken.
+        await ensure_device_awake()
 
         device = None
         for d in device_manager.get_devices():
