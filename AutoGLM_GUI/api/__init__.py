@@ -21,6 +21,7 @@ from starlette.types import Scope
 
 from AutoGLM_GUI.adb_plus.qr_pair import qr_pairing_manager
 from AutoGLM_GUI.logger import logger
+from AutoGLM_GUI.managed import bind_managed_device, load_managed_settings
 from AutoGLM_GUI.version import APP_VERSION
 
 from . import (
@@ -164,9 +165,19 @@ def create_app() -> FastAPI:
         from AutoGLM_GUI.scheduler_manager import scheduler_manager
         from AutoGLM_GUI.task_manager import task_manager
 
+        # Managed mode: bind the single device provisioned by the control plane.
+        # Misconfiguration fails fast so the control plane sees the runtime exit.
+        managed_settings = load_managed_settings()
+
         adb_path = os.environ.get("AUTOGLM_ADB_PATH", "adb")
         device_manager = DeviceManager.get_instance(adb_path=adb_path)
         device_manager.start_polling()
+
+        managed_bind_task: asyncio.Task[str | None] | None = None
+        if managed_settings.enabled:
+            managed_bind_task = asyncio.create_task(
+                bind_managed_device(device_manager, managed_settings, adb_path=adb_path)
+            )
 
         await task_manager.start()
         # Start scheduled task scheduler
@@ -177,6 +188,8 @@ def create_app() -> FastAPI:
             yield
 
         # App shutdown
+        if managed_bind_task is not None and not managed_bind_task.done():
+            managed_bind_task.cancel()
         await scheduler_manager.shutdown()
         await task_manager.shutdown()
 
