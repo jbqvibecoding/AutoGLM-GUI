@@ -194,6 +194,8 @@ export const zh = {
     swiped: '已滑动',
     swipeError: '滑动错误: {error}',
     newMessages: '有新消息，点击查看最新',
+    approvalRequired: '等待你确认：',
+    openApprovals: '去确认',
     tooltips: {
       workflowButton: '快速执行工作流',
       workflowButtonDesc: '选择并快速执行预设的工作流任务',

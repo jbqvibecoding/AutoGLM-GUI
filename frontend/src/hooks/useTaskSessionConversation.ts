@@ -44,6 +44,8 @@ export interface TaskConversationMessage {
   isStreaming?: boolean;
   currentThinking?: string;
   attachments?: TaskImageAttachment[];
+  // Managed mode: a sensitive action waiting for the user's approval.
+  pendingApproval?: string;
 }
 
 interface UseTaskSessionConversationOptions {
@@ -153,6 +155,7 @@ function buildAssistantMessage(
   const stepNumbers: number[] = [];
   let errorDetails: ModelErrorDetails | undefined;
   let currentThinking = '';
+  let pendingApproval: string | undefined;
   let content = task.final_message || task.error_message || '';
   let steps = task.step_count;
   let success: boolean | undefined =
@@ -248,6 +251,15 @@ function buildAssistantMessage(
         currentThinking = '';
         break;
       }
+      case 'approval_required': {
+        pendingApproval =
+          typeof payload.message === 'string' ? payload.message : '';
+        break;
+      }
+      case 'approval_resolved': {
+        pendingApproval = undefined;
+        break;
+      }
     }
   });
 
@@ -266,6 +278,7 @@ function buildAssistantMessage(
     success,
     isStreaming: isTaskActive(task.status),
     currentThinking: currentThinking || undefined,
+    pendingApproval: isTaskActive(task.status) ? pendingApproval : undefined,
   };
 }
 
