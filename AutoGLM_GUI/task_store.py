@@ -458,6 +458,17 @@ class TaskStore:
                 self._fetchone("SELECT * FROM task_runs WHERE id = ?", (task_id,))
             )
 
+    def find_task_id_by_trace(self, trace_id: str) -> str | None:
+        """The most recent task that runs under ``trace_id``."""
+        self._ensure_ready()
+        with self._lock:
+            row = self._fetchone(
+                "SELECT id FROM task_runs WHERE trace_id = ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (trace_id,),
+            )
+        return str(row["id"]) if row is not None else None
+
     def list_tasks(
         self,
         *,

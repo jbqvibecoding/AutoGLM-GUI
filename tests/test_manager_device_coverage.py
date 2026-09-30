@@ -937,3 +937,50 @@ def test_agent_factory_and_adb_manager(
     cached_adb.unlink()
     with pytest.raises(RuntimeError, match="Failed to download"):
         adb_manager.ensure_adb()
+
+
+def test_scheduled_workflow_takeover_explains_the_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_task_tracing(monkeypatch)
+    store = TaskStore(tmp_path / "scheduled-takeover.db")
+    manager = TaskManager(store)
+    monkeypatch.setattr(manager, "_ensure_worker", lambda device_id: None)
+
+    class TakeoverAgent(FakeAgent):
+        async def stream(self, text: str, *, continue_with: str | None = None):
+            yield {
+                "type": "step",
+                "data": {
+                    "step": 3,
+                    "action": {"action": "Take_over", "message": "请完成验证码"},
+                    "waiting_for_input": True,
+                },
+            }
+            yield {
+                "type": "takeover",
+                "data": {"message": "请完成验证码", "steps": 3, "success": True},
+            }
+
+    fake_phone_manager = FakePhoneAgentManager(TakeoverAgent())
+    monkeypatch.setattr(
+        PhoneAgentManager,
+        "get_instance",
+        classmethod(lambda cls: fake_phone_manager),
+    )
+    task = store.create_task_run(
+        source="scheduled",
+        executor_key="scheduled_workflow",
+        device_id="device-1",
+        device_serial="serial-1",
+        input_text="签到",
+    )
+    asyncio.run(manager._execute_scheduled_workflow(task))
+
+    finished = store.get_task(task["id"])
+    assert finished is not None
+    assert finished["status"] == TaskStatus.FAILED.value
+    assert finished["stop_reason"] == "takeover"
+    assert finished["final_message"] == "需要人工接管：请完成验证码"
+    assert finished["step_count"] == 3
+    store.close()

@@ -19,7 +19,12 @@ from AutoGLM_GUI.exceptions import (
     DeviceBusyError,
 )
 from AutoGLM_GUI.logger import logger
-from AutoGLM_GUI.managed import ensure_device_awake
+from AutoGLM_GUI.managed import (
+    ensure_device_awake,
+    is_managed_mode,
+    managed_confirmation,
+    managed_takeover,
+)
 from AutoGLM_GUI.trace import trace_span
 from AutoGLM_GUI.types import AgentSpecificConfig
 
@@ -437,14 +442,27 @@ class PhoneAgentManager:
             # 在Web模式下默认确认，让前端处理
             return True
 
+        takeover_callback: Callable[[str], None] = noop_takeover
+        confirmation_callback: Callable[[str], bool] = noop_confirmation
+        if is_managed_mode():
+            # 托管模式：敏感操作需要用户在控制面批准，接管请求会通知用户
+            # agent_key 是 device_id 或 device_id:context（device_id 本身可能含冒号）
+            context = (
+                agent_key.removeprefix(f"{actual_device_id}:")
+                if agent_key != actual_device_id
+                else "default"
+            )
+            takeover_callback = managed_takeover(actual_device_id, context)
+            confirmation_callback = managed_confirmation(actual_device_id, context)
+
         await self._initialize_agent_with_factory_unsafe(
             device_id=agent_key,
             agent_type=effective_agent_type,
             model_config=model_config,
             agent_config=agent_config,
             agent_specific_config=agent_specific_config,
-            takeover_callback=noop_takeover,
-            confirmation_callback=noop_confirmation,
+            takeover_callback=takeover_callback,
+            confirmation_callback=confirmation_callback,
         )
         logger.info(f"Agent auto-initialized for key {agent_key}")
 

@@ -21,6 +21,12 @@ the runtime uses the phone (tasks, scheduled tasks, the live stream) it calls
 :func:`ensure_device_awake`, which asks the control plane to wake the phone and
 reconnects to it; a heartbeat tells the control plane when the runtime is busy.
 
+Sensitive actions (a ``Tap`` the model marks with ``message``) need the user's
+approval through the control plane instead of being auto-confirmed, and
+takeover requests are reported to it so the user is told (see
+:func:`managed_confirmation` and :func:`managed_takeover`). Approvals fail
+closed: no answer, an error or no reachable control plane means "denied".
+
 Managed mode is off by default; nothing here changes the behaviour of a normal
 local installation.
 """
@@ -32,7 +38,7 @@ import os
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
@@ -54,6 +60,13 @@ DEFAULT_WAKE_TIMEOUT = 240.0
 # wake counts as activity, so a wake is still valid for a short while.
 WAKE_DEBOUNCE_SECONDS = 30.0
 HEARTBEAT_INTERVAL_SECONDS = 30.0
+
+# Each approval long-poll waits at most this long for the user's decision.
+APPROVAL_POLL_SECONDS = 25.0
+# Extra time past the approval's expiry before the runtime stops asking.
+APPROVAL_GRACE_SECONDS = 30.0
+APPROVAL_RETRY_DELAY = 2.0
+APPROVAL_STATUSES = {"approved", "denied", "expired"}
 
 
 @dataclass(frozen=True)
@@ -253,6 +266,133 @@ class ControlPlaneClient:
         await self._client.aclose()
 
 
+# ---------------------------------------------------------------------- approvals
+
+
+class ApprovalClient:
+    """Asks the control plane for the user's decision on a sensitive action.
+
+    Synchronous on purpose: action callbacks run in worker threads
+    (``asyncio.to_thread``), where blocking until the user answers is fine.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        token: str,
+        *,
+        transport: httpx.BaseTransport | None = None,
+        poll_seconds: float = APPROVAL_POLL_SECONDS,
+        retry_delay: float = APPROVAL_RETRY_DELAY,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._headers = {"Authorization": f"Bearer {token}"}
+        self._transport = transport
+        self._poll = poll_seconds
+        self._retry_delay = retry_delay
+        self._clock = clock
+        self._sleep = sleep
+
+    def _client(self) -> httpx.Client:
+        return httpx.Client(
+            base_url=self._base_url,
+            headers=self._headers,
+            timeout=10.0,
+            transport=self._transport,
+        )
+
+    def request(
+        self,
+        message: str,
+        *,
+        device_id: str,
+        context: str,
+        on_created: Callable[[str], None] | None = None,
+    ) -> str:
+        """Block until the user decides.
+
+        Returns ``approved``, ``denied``, ``expired`` or ``error``; anything
+        but ``approved`` must be treated as a refusal.
+        """
+        with self._client() as client:
+            try:
+                resp = client.post(
+                    "/internal/runtime/approvals",
+                    json={
+                        "message": message,
+                        "device_id": device_id,
+                        "context": context,
+                    },
+                )
+            except httpx.HTTPError as exc:
+                logger.error(f"[Managed] Approval request failed: {exc}")
+                return "error"
+            if resp.status_code != 201:
+                logger.error(
+                    f"[Managed] Approval request rejected: HTTP {resp.status_code}"
+                )
+                return "error"
+            approval = resp.json()
+            approval_id = str(approval["id"])
+            deadline = (
+                self._clock()
+                + float(approval.get("expires_in", 0))
+                + APPROVAL_GRACE_SECONDS
+            )
+            if on_created is not None:
+                on_created(approval_id)
+
+            while approval.get("status") not in APPROVAL_STATUSES:
+                if self._clock() > deadline:
+                    return "expired"
+                try:
+                    resp = client.get(
+                        f"/internal/runtime/approvals/{approval_id}",
+                        params={"wait": self._poll},
+                        timeout=self._poll + 10.0,
+                    )
+                except httpx.HTTPError as exc:
+                    logger.warning(f"[Managed] Approval poll failed, retrying: {exc}")
+                    self._sleep(self._retry_delay)
+                    continue
+                if resp.status_code == 200:
+                    approval = resp.json()
+                elif resp.status_code >= 500:
+                    logger.warning(
+                        f"[Managed] Approval poll got HTTP {resp.status_code}, retrying"
+                    )
+                    self._sleep(self._retry_delay)
+                else:
+                    logger.error(
+                        f"[Managed] Approval poll rejected: HTTP {resp.status_code}"
+                    )
+                    return "error"
+            return str(approval["status"])
+
+    def report_event(
+        self, kind: str, message: str, *, device_id: str, context: str
+    ) -> None:
+        """Best effort: tell the control plane (and so the user) what happened."""
+        try:
+            with self._client() as client:
+                resp = client.post(
+                    "/internal/runtime/events",
+                    json={
+                        "kind": kind,
+                        "message": message,
+                        "device_id": device_id,
+                        "context": context,
+                    },
+                    timeout=5.0,
+                )
+            if resp.status_code >= 400:
+                logger.warning(f"[Managed] Event report rejected: {resp.status_code}")
+        except httpx.HTTPError as exc:
+            logger.warning(f"[Managed] Event report failed: {exc}")
+
+
 class ManagedRuntime:
     """Keeps the managed phone awake while the runtime needs it."""
 
@@ -262,6 +402,7 @@ class ManagedRuntime:
         device_manager: DeviceManager,
         client: ControlPlaneClient,
         *,
+        approvals: ApprovalClient | None = None,
         adb_path: str = "adb",
         debounce_seconds: float = WAKE_DEBOUNCE_SECONDS,
         rebind_attempts: int = 10,
@@ -271,6 +412,7 @@ class ManagedRuntime:
         self._settings = settings
         self._device_manager = device_manager
         self.client = client
+        self.approvals = approvals
         self._adb_path = adb_path
         self._debounce = debounce_seconds
         self._rebind_attempts = rebind_attempts
@@ -349,10 +491,12 @@ def start_managed_runtime(
                 "[Managed] AUTOGLM_CONTROL_PLANE_URL not set; wake-on-demand is off"
             )
         return None
+    token = settings.internal_token or ""
     runtime = ManagedRuntime(
         settings,
         device_manager,
-        ControlPlaneClient(settings.control_plane_url, settings.internal_token or ""),
+        ControlPlaneClient(settings.control_plane_url, token),
+        approvals=ApprovalClient(settings.control_plane_url, token),
         adb_path=adb_path,
     )
     set_managed_runtime(runtime)
@@ -372,3 +516,95 @@ async def ensure_device_awake() -> None:
         await runtime.ensure_device_awake()
     except ManagedWakeError as exc:
         logger.error(f"[Managed] {exc}")
+
+
+# ------------------------------------------------------------- agent callbacks
+
+
+def _current_task_id() -> str | None:
+    """The task whose trace is active in this thread (contextvars are copied
+    into ``asyncio.to_thread`` workers)."""
+    from AutoGLM_GUI.task_store import task_store
+    from AutoGLM_GUI.trace import current_trace_id
+
+    trace_id = current_trace_id()
+    if not trace_id:
+        return None
+    try:
+        return task_store.find_task_id_by_trace(trace_id)
+    except Exception:
+        logger.exception("[Managed] Could not look up the task for an approval")
+        return None
+
+
+def _append_task_event(
+    task_id: str | None, event_type: str, payload: dict[str, Any]
+) -> None:
+    if task_id is None:
+        return
+    from AutoGLM_GUI.task_store import task_store
+
+    try:
+        task_store.append_event(task_id=task_id, event_type=event_type, payload=payload)
+    except Exception:
+        logger.exception(f"[Managed] Could not record {event_type} for task {task_id}")
+
+
+def managed_confirmation(device_id: str, context: str) -> Callable[[str], bool]:
+    """Confirmation callback that asks the user through the control plane.
+
+    Blocks until the user decides. Denies when there is no control plane, on
+    errors and on expiry.
+    """
+
+    def confirm(message: str) -> bool:
+        runtime = _managed_runtime
+        if runtime is None or runtime.approvals is None:
+            logger.error(f"[Managed] No control plane to approve {message!r}; denied")
+            return False
+
+        task_id = _current_task_id()
+        approval_id: str | None = None
+
+        def created(new_id: str) -> None:
+            nonlocal approval_id
+            approval_id = new_id
+            _append_task_event(
+                task_id,
+                "approval_required",
+                {"approval_id": new_id, "message": message},
+            )
+
+        try:
+            status = runtime.approvals.request(
+                message, device_id=device_id, context=context, on_created=created
+            )
+        except Exception:
+            # e.g. a malformed reply: fail closed like any other error
+            logger.exception("[Managed] Approval request crashed; denied")
+            status = "error"
+        if approval_id is not None:
+            _append_task_event(
+                task_id,
+                "approval_resolved",
+                {"approval_id": approval_id, "status": status},
+            )
+        logger.info(f"[Managed] Approval for {message!r}: {status}")
+        return status == "approved"
+
+    return confirm
+
+
+def managed_takeover(device_id: str, context: str) -> Callable[[str], None]:
+    """Takeover callback that tells the user through the control plane."""
+
+    def takeover(message: str) -> None:
+        logger.info(f"[Managed] Takeover requested: {message}")
+        runtime = _managed_runtime
+        if runtime is None or runtime.approvals is None:
+            return
+        runtime.approvals.report_event(
+            "takeover", message, device_id=device_id, context=context
+        )
+
+    return takeover

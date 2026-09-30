@@ -967,6 +967,17 @@ class TaskManager:
                             stop_reason = str(
                                 event_data.get("stop_reason", "user_stopped")
                             )
+                        elif event_type == "takeover":
+                            # 定时任务无人值守，无法原地继续：记为失败并说明原因
+                            takeover_message = str(event_data.get("message") or "")
+                            final_message = (
+                                f"需要人工接管：{takeover_message}"
+                                if takeover_message
+                                else "需要人工接管"
+                            )
+                            final_status = TaskStatus.FAILED.value
+                            stop_reason = "takeover"
+                            step_count = int(event_data.get("steps", step_count))
 
                 if not final_message:
                     final_message = "Task finished without a final response"

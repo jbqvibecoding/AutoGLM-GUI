@@ -1063,6 +1063,25 @@ export function DevicePanel({
                             );
                           })()}
 
+                        {/* Managed mode: waiting for the user's approval */}
+                        {message.pendingApproval !== undefined && (
+                          <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-300">
+                            <Hand className="w-4 h-4 flex-shrink-0 mt-0.5" />
+                            <span className="min-w-0 flex-1 whitespace-pre-wrap">
+                              {t.devicePanel.approvalRequired}{' '}
+                              {message.pendingApproval}{' '}
+                              <a
+                                href="/cp/approvals"
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="font-medium underline"
+                              >
+                                {t.devicePanel.openApprovals}
+                              </a>
+                            </span>
+                          </div>
+                        )}
+
                         {/* Streaming indicator */}
                         {message.isStreaming && (
                           <div className="flex items-center gap-2 text-sm text-slate-500 dark:text-slate-400">

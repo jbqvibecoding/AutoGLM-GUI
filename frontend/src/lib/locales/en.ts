@@ -201,6 +201,8 @@ export const en = {
     swiped: 'Swiped',
     swipeError: 'Swipe error: {error}',
     newMessages: 'New messages. Click to view latest',
+    approvalRequired: 'Waiting for your approval:',
+    openApprovals: 'Review it',
     tooltips: {
       workflowButton: 'Quick Workflow',
       workflowButtonDesc: 'Select and execute preset workflow tasks',
