@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ValidationError
 
+from AutoGLM_GUI.managed import is_managed_mode
 from AutoGLM_GUI.schemas import (
     AbortRequest,
     ChatRequest,
@@ -20,6 +21,8 @@ from AutoGLM_GUI.schemas import (
     StatusResponse,
 )
 from AutoGLM_GUI.version import APP_VERSION
+
+_MASKED_KEY = "********"
 
 router = APIRouter()
 
@@ -214,10 +217,17 @@ def get_config_endpoint() -> ConfigResponse:
     # 检测冲突
     conflicts = config_manager.detect_conflicts()
 
+    api_key = effective_config.api_key if effective_config.api_key != "EMPTY" else ""
+    decision_api_key = effective_config.decision_api_key
+    if is_managed_mode():
+        # Managed runtimes get platform-issued keys; never echo them to the browser.
+        api_key = _MASKED_KEY if api_key else ""
+        decision_api_key = _MASKED_KEY if decision_api_key else decision_api_key
+
     return ConfigResponse(
         base_url=effective_config.base_url,
         model_name=effective_config.model_name,
-        api_key=effective_config.api_key if effective_config.api_key != "EMPTY" else "",
+        api_key=api_key,
         source=source.value,
         agent_type=effective_config.agent_type,
         agent_config_params=effective_config.agent_config_params,
@@ -225,7 +235,7 @@ def get_config_endpoint() -> ConfigResponse:
         layered_max_turns=effective_config.layered_max_turns,
         decision_base_url=effective_config.decision_base_url,
         decision_model_name=effective_config.decision_model_name,
-        decision_api_key=effective_config.decision_api_key,
+        decision_api_key=decision_api_key,
         conflicts=[
             {
                 "field": c.field,

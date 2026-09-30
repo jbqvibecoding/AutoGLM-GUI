@@ -18,6 +18,8 @@ from AutoGLM_GUI.managed import (
 
 pytestmark = pytest.mark.unit
 
+TOKEN = "t" * 32
+
 
 class TestLoadManagedSettings:
     def test_disabled_by_default(self) -> None:
@@ -36,20 +38,21 @@ class TestLoadManagedSettings:
                 "AUTOGLM_MANAGED_MODE": "true",
                 "AUTOGLM_DEVICE_SERIAL": " 10.0.0.2:5555 ",
                 "AUTOGLM_CONTROL_PLANE_URL": "http://control-plane:8000",
-                "AUTOGLM_INTERNAL_TOKEN": "secret",
+                "AUTOGLM_INTERNAL_TOKEN": TOKEN,
             }
         )
         assert settings.enabled is True
         assert settings.device_serial == "10.0.0.2:5555"
         assert settings.device_remote_url is None
         assert settings.control_plane_url == "http://control-plane:8000"
-        assert settings.internal_token == "secret"
+        assert settings.internal_token == TOKEN
 
     def test_remote_url_binding(self) -> None:
         settings = load_managed_settings(
             {
                 "AUTOGLM_MANAGED_MODE": "1",
                 "AUTOGLM_DEVICE_REMOTE_URL": "http://device-agent:8001/",
+                "AUTOGLM_INTERNAL_TOKEN": TOKEN,
             }
         )
         assert settings.device_remote_url == "http://device-agent:8001"
@@ -61,6 +64,7 @@ class TestLoadManagedSettings:
                 "AUTOGLM_MANAGED_MODE": "1",
                 "AUTOGLM_DEVICE_REMOTE_URL": "http://device-agent:8001",
                 "AUTOGLM_DEVICE_REMOTE_ID": "phone-42",
+                "AUTOGLM_INTERNAL_TOKEN": TOKEN,
             }
         )
         assert settings.device_remote_id == "phone-42"
@@ -78,11 +82,27 @@ class TestLoadManagedSettings:
             ),
             ({"AUTOGLM_DEVICE_SERIAL": "emulator-5554"}, "host:port"),
             ({"AUTOGLM_DEVICE_REMOTE_URL": "device-agent:8001"}, "http://"),
+            (
+                {
+                    "AUTOGLM_DEVICE_REMOTE_URL": "http://device-agent:8001",
+                    "AUTOGLM_INTERNAL_TOKEN": "",
+                },
+                "AUTOGLM_INTERNAL_TOKEN",
+            ),
+            (
+                {
+                    "AUTOGLM_DEVICE_REMOTE_URL": "http://device-agent:8001",
+                    "AUTOGLM_INTERNAL_TOKEN": "short",
+                },
+                "at least 16",
+            ),
         ],
     )
     def test_invalid_binding_rejected(self, env: dict[str, str], match: str) -> None:
         with pytest.raises(ValueError, match=match):
-            load_managed_settings({"AUTOGLM_MANAGED_MODE": "1", **env})
+            load_managed_settings(
+                {"AUTOGLM_MANAGED_MODE": "1", "AUTOGLM_INTERNAL_TOKEN": TOKEN, **env}
+            )
 
 
 class _FakeDeviceManager:
@@ -194,6 +214,7 @@ def test_lifespan_binds_managed_device(monkeypatch: pytest.MonkeyPatch) -> None:
     from AutoGLM_GUI.task_manager import task_manager
 
     monkeypatch.setenv("AUTOGLM_MANAGED_MODE", "1")
+    monkeypatch.setenv("AUTOGLM_INTERNAL_TOKEN", TOKEN)
     monkeypatch.setenv("AUTOGLM_DEVICE_REMOTE_URL", "http://agent:8001")
     monkeypatch.setenv("AUTOGLM_DEVICE_REMOTE_ID", "phone-42")
 
@@ -263,5 +284,6 @@ def test_lifespan_skips_binding_when_not_managed(
 
 def test_module_reads_process_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AUTOGLM_MANAGED_MODE", "yes")
+    monkeypatch.setenv("AUTOGLM_INTERNAL_TOKEN", TOKEN)
     monkeypatch.setenv("AUTOGLM_DEVICE_SERIAL", "10.0.0.2:5555")
     assert managed.load_managed_settings().device_serial == "10.0.0.2:5555"
