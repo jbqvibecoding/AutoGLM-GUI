@@ -9,9 +9,12 @@ control plane provisioned. The device is supplied through the environment:
   :mod:`AutoGLM_GUI.devices.remote_device`), used for mock devices in CI.
   ``AUTOGLM_DEVICE_REMOTE_ID`` selects the device on that agent.
 
-Exactly one of the two must be set. ``AUTOGLM_CONTROL_PLANE_URL`` and
-``AUTOGLM_INTERNAL_TOKEN`` are read here so later managed-mode features share
-one settings object.
+Exactly one of the two must be set.
+
+``AUTOGLM_INTERNAL_TOKEN`` is required: the gateway sends it on every request
+(see :mod:`AutoGLM_GUI.managed_guard`), so the runtime only answers traffic
+that the control plane authorized. ``AUTOGLM_CONTROL_PLANE_URL`` is where the
+runtime reaches the control plane's internal API.
 
 Managed mode is off by default; nothing here changes the behaviour of a normal
 local installation.
@@ -31,6 +34,7 @@ if TYPE_CHECKING:
     from AutoGLM_GUI.device_manager import DeviceManager
 
 _TRUE_VALUES = {"1", "true", "yes", "on"}
+MIN_INTERNAL_TOKEN_LENGTH = 16
 
 DEFAULT_REMOTE_DEVICE_ID = "managed-device"
 DEFAULT_BIND_ATTEMPTS = 15
@@ -65,8 +69,7 @@ def load_managed_settings(env: Mapping[str, str] | None = None) -> ManagedSettin
     """
     env = os.environ if env is None else env
 
-    enabled = (env.get("AUTOGLM_MANAGED_MODE") or "").strip().lower() in _TRUE_VALUES
-    if not enabled:
+    if not is_managed_mode(env):
         return ManagedSettings()
 
     device_serial = _clean(env.get("AUTOGLM_DEVICE_SERIAL"))
@@ -90,6 +93,12 @@ def load_managed_settings(env: Mapping[str, str] | None = None) -> ManagedSettin
         raise ValueError(
             "Managed mode: AUTOGLM_DEVICE_REMOTE_URL must start with http:// or https://"
         )
+    internal_token = _clean(env.get("AUTOGLM_INTERNAL_TOKEN"))
+    if not internal_token or len(internal_token) < MIN_INTERNAL_TOKEN_LENGTH:
+        raise ValueError(
+            "Managed mode requires AUTOGLM_INTERNAL_TOKEN "
+            f"(at least {MIN_INTERNAL_TOKEN_LENGTH} characters)"
+        )
 
     return ManagedSettings(
         enabled=True,
@@ -98,8 +107,14 @@ def load_managed_settings(env: Mapping[str, str] | None = None) -> ManagedSettin
         device_remote_id=_clean(env.get("AUTOGLM_DEVICE_REMOTE_ID"))
         or DEFAULT_REMOTE_DEVICE_ID,
         control_plane_url=_clean(env.get("AUTOGLM_CONTROL_PLANE_URL")),
-        internal_token=_clean(env.get("AUTOGLM_INTERNAL_TOKEN")),
+        internal_token=internal_token,
     )
+
+
+def is_managed_mode(env: Mapping[str, str] | None = None) -> bool:
+    """Whether managed mode is switched on (without validating its settings)."""
+    env = os.environ if env is None else env
+    return (env.get("AUTOGLM_MANAGED_MODE") or "").strip().lower() in _TRUE_VALUES
 
 
 async def bind_managed_device(

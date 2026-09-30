@@ -19,6 +19,7 @@ from fastapi import (
 
 from AutoGLM_GUI.adb_terminal_service import terminal_session_manager
 from AutoGLM_GUI.logger import logger
+from AutoGLM_GUI.managed import is_managed_mode
 from AutoGLM_GUI.schemas import (
     TerminalSessionCloseResponse,
     TerminalSessionCreateRequest,
@@ -50,6 +51,9 @@ def _is_loopback_host(host: str | None) -> bool:
 
 
 def _is_terminal_feature_enabled() -> bool:
+    # A host shell is never offered on a managed (hosted) runtime.
+    if is_managed_mode():
+        return False
     return _is_loopback_host(_server_host()) or _terminal_explicitly_enabled()
 
 
