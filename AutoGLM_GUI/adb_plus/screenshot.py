@@ -22,6 +22,7 @@ from AutoGLM_GUI.adb_plus.display import (
 )
 from AutoGLM_GUI.exceptions import DeviceNotAvailableError
 from AutoGLM_GUI.logger import logger
+from AutoGLM_GUI.managed import is_managed_mode
 from AutoGLM_GUI.platform_utils import is_windows
 from AutoGLM_GUI.trace import TraceSpan, trace_span
 
@@ -305,6 +306,32 @@ async def _try_capture_async(
         return None
 
 
+# A protected (FLAG_SECURE) window, such as a payment or password page, is
+# captured as black. The status and navigation bars may still be drawn, so
+# only the middle band of the screen is checked.
+_BLANK_BAND = (0.10, 0.88)
+_BLANK_MAX_LEVEL = 12
+
+
+def is_blank_frame(img: Image.Image) -> bool:
+    """Whether the screen content is black (hidden from screenshots)."""
+    width, height = img.size
+    top, bottom = int(height * _BLANK_BAND[0]), int(height * _BLANK_BAND[1])
+    if width <= 0 or bottom <= top:
+        return False
+    band = img.crop((0, top, width, bottom)).convert("L")
+    # Keep only pixels brighter than the threshold; none left means blank.
+    lut = [0] * (_BLANK_MAX_LEVEL + 1) + [255] * (255 - _BLANK_MAX_LEVEL)
+    bright = band.point(lut)
+    return bright.getbbox() is None
+
+
+def _is_protected(img: Image.Image) -> bool:
+    """Flag hidden screens in managed mode only, where the agent pauses on
+    them; elsewhere ``is_sensitive`` keeps its previous value."""
+    return is_managed_mode() and is_blank_frame(img)
+
+
 def _is_valid_png(data: bytes) -> bool:
     """Basic PNG validation (signature + minimal length)."""
     return (
@@ -321,7 +348,12 @@ def _decode_screenshot(data: bytes | None, device_id: str | None) -> Screenshot 
         img = Image.open(BytesIO(data))
         width, height = img.size
         base64_data = base64.b64encode(data).decode("utf-8")
-        return Screenshot(base64_data=base64_data, width=width, height=height)
+        return Screenshot(
+            base64_data=base64_data,
+            width=width,
+            height=height,
+            is_sensitive=_is_protected(img),
+        )
     except Exception as exc:
         logger.debug("Failed to decode screenshot PNG for %s: %s", device_id, exc)
         return None
@@ -338,7 +370,13 @@ async def _decode_screenshot_async(
         image = await asyncio.to_thread(Image.open, BytesIO(data))
         width, height = image.size
         base64_data = base64.b64encode(data).decode("utf-8")
-        return Screenshot(base64_data=base64_data, width=width, height=height)
+        is_sensitive = await asyncio.to_thread(_is_protected, image)
+        return Screenshot(
+            base64_data=base64_data,
+            width=width,
+            height=height,
+            is_sensitive=is_sensitive,
+        )
     except Exception as exc:
         logger.debug("Failed to decode async screenshot PNG for %s: %s", device_id, exc)
         return None
@@ -370,12 +408,19 @@ def _set_display_trace_attrs(
 
 
 def _fallback_screenshot() -> Screenshot:
-    """Return a black fallback image."""
+    """Return a black fallback image.
+
+    In managed mode it is marked sensitive: the agent cannot see the screen,
+    so it pauses instead of acting on a black image.
+    """
     width, height = 1080, 2400
     img = Image.new("RGB", (width, height), color="black")
     buffered = BytesIO()
     img.save(buffered, format="PNG")
     base64_data = base64.b64encode(buffered.getvalue()).decode("utf-8")
     return Screenshot(
-        base64_data=base64_data, width=width, height=height, is_sensitive=False
+        base64_data=base64_data,
+        width=width,
+        height=height,
+        is_sensitive=is_managed_mode(),
     )
