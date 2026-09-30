@@ -12,6 +12,7 @@ from typing_extensions import TypedDict
 import socketio
 
 from AutoGLM_GUI.logger import logger
+from AutoGLM_GUI.managed import ensure_device_awake
 from AutoGLM_GUI.scrcpy_protocol import ScrcpyMediaStreamPacket
 from AutoGLM_GUI.scrcpy_stream import ScrcpyStreamer
 
@@ -35,6 +36,11 @@ _stream_tasks: dict[str, asyncio.Task[None]] = {}
 _device_locks: dict[
     str, asyncio.Lock
 ] = {}  # Lock per device to prevent concurrent connections
+
+
+def active_stream_count() -> int:
+    """Number of live scrcpy streams (people watching the phone)."""
+    return len(_socket_streamers)
 
 
 async def _stop_stream_for_sid(sid: str) -> None:
@@ -156,6 +162,9 @@ async def connect_device(sid: str, data: dict[str, Any] | None) -> None:
             to=sid,
         )
         return
+
+    # Managed mode: the control plane may have put the phone to sleep.
+    await ensure_device_awake()
 
     max_size = int(payload.get("maxSize") or 1280)
     bit_rate = int(payload.get("bitRate") or 4_000_000)

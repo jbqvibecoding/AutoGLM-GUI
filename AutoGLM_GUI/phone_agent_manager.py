@@ -19,6 +19,7 @@ from AutoGLM_GUI.exceptions import (
     DeviceBusyError,
 )
 from AutoGLM_GUI.logger import logger
+from AutoGLM_GUI.managed import ensure_device_awake
 from AutoGLM_GUI.trace import trace_span
 from AutoGLM_GUI.types import AgentSpecificConfig
 
@@ -712,6 +713,8 @@ class PhoneAgentManager:
         context: str = "default",
     ) -> bool:
         """Acquire a device lock without leaking it if the awaiter is cancelled."""
+        # Managed mode: the control plane may have put the phone to sleep.
+        await ensure_device_awake()
         acquire_task = asyncio.create_task(
             self._acquire_device_impl(
                 device_id,
@@ -997,6 +1000,13 @@ class PhoneAgentManager:
 
     def get_metadata_snapshot(self) -> dict[str, AgentMetadata]:
         return self._run_sync(self._get_metadata_snapshot_impl())
+
+    async def has_busy_agent_async(self) -> bool:
+        """Whether any agent is currently running a task."""
+        busy = False
+        async with self._manager_lock:
+            busy = any(m.state == AgentState.BUSY for m in self._metadata.values())
+        return busy
 
     async def _get_streaming_sessions_count_impl(self) -> int:
         count = 0
