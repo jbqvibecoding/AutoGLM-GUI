@@ -47,6 +47,9 @@ class MockAgentState:
     def __init__(self):
         self.commands: list[CommandRecord] = []
         self.state_machine = None
+        # Simulates a protected (FLAG_SECURE) screen: screenshots report
+        # is_sensitive, as a real device's black capture would.
+        self.sensitive = False
         self.scenario_path: str | None = None
         self.available_devices: list[dict] = [
             {
@@ -69,8 +72,9 @@ class MockAgentState:
         )
 
     def reset(self):
-        """Reset command history."""
+        """Reset command history and the protected-screen switch."""
         self.commands = []
+        self.sensitive = False
 
     def load_scenario(self, path: str | Path):
         """Load a test scenario (state machine)."""
@@ -87,13 +91,13 @@ class MockAgentState:
                 "base64_data": result.base64_data,
                 "width": result.width,
                 "height": result.height,
-                "is_sensitive": False,
+                "is_sensitive": self.sensitive,
             }
         return {
             "base64_data": "",
             "width": 1080,
             "height": 2400,
-            "is_sensitive": False,
+            "is_sensitive": self.sensitive,
         }
 
     def get_current_app(self) -> str:
@@ -108,6 +112,10 @@ class MockAgentState:
 
 
 state = MockAgentState()
+
+
+class SensitiveRequest(BaseModel):
+    sensitive: bool
 
 
 class TapRequest(BaseModel):
@@ -293,6 +301,12 @@ def _register_routes(app: FastAPI):
         """Reset command history."""
         state.reset()
         return {"status": "reset", "commands_cleared": True}
+
+    @app.post("/test/sensitive")
+    async def set_sensitive(req: SensitiveRequest):
+        """Make screenshots report a protected (FLAG_SECURE) screen."""
+        state.sensitive = req.sensitive
+        return {"sensitive": state.sensitive}
 
     @app.post("/test/load_scenario")
     async def load_scenario(req: LoadScenarioRequest):

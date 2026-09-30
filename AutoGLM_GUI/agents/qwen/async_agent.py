@@ -160,6 +160,11 @@ class AsyncQwenAgent(AsyncAgentBase, AsyncAgent):
             }
             return
 
+        paused = await self._protected_screen_step(screenshot)
+        if paused is not None:
+            yield paused
+            return
+
         # 2. 构建消息
         with trace_span(
             "step.build_message",

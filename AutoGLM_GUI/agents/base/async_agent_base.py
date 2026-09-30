@@ -22,6 +22,7 @@ from AutoGLM_GUI.config import AgentConfig, ModelConfig
 from AutoGLM_GUI.device_protocol import AsyncDeviceProtocol, DeviceProtocol
 from AutoGLM_GUI.devices.async_adapter import AsyncDeviceAdapter
 from AutoGLM_GUI.logger import logger
+from AutoGLM_GUI.managed import is_managed_mode
 from AutoGLM_GUI.model import MessageBuilder
 from AutoGLM_GUI.trace import summarize_text, trace_span
 
@@ -29,6 +30,11 @@ from AutoGLM_GUI.trace import summarize_text, trace_span
 WATCHDOG_MAX_RUNTIME_SECONDS = 60 * 60
 WATCHDOG_REPEATED_ACTION_LIMIT = 12
 WATCHDOG_NO_PROGRESS_LIMIT = 20
+
+PROTECTED_SCREEN_MESSAGE = (
+    "当前页面受保护（如支付或密码页），agent 看不到画面，已暂停。"
+    "请自行处理后回复“继续”。"
+)
 
 
 class AsyncAgentBase(ABC):
@@ -111,6 +117,38 @@ class AsyncAgentBase(ABC):
 
     # ==================== 共享逻辑 ====================
 
+    async def _protected_screen_step(self, screenshot: Any) -> dict[str, Any] | None:
+        """托管模式下，截图看不到内容（受保护页面）时暂停并请求接管。
+
+        返回一个 waiting_for_input 的 step 事件（stream 会把它转成 takeover），
+        否则返回 None。接管经由 action handler，托管模式下会通知用户。
+        """
+        if not getattr(screenshot, "is_sensitive", False) or not is_managed_mode():
+            return None
+        action = {
+            "_metadata": "do",
+            "action": "Take_over",
+            "message": PROTECTED_SCREEN_MESSAGE,
+        }
+        result = await self.action_handler.execute(
+            action, screenshot.width, screenshot.height
+        )
+        logger.warning(
+            "Protected screen at step %d; pausing for takeover", self._step_count
+        )
+        return {
+            "type": "step",
+            "data": {
+                "step": self._step_count,
+                "thinking": "",
+                "action": action,
+                "success": result.success,
+                "finished": False,
+                "waiting_for_input": True,
+                "message": PROTECTED_SCREEN_MESSAGE,
+            },
+        }
+
     async def stream(
         self, task: str, *, continue_with: str | None = None
     ) -> AsyncIterator[dict[str, Any]]:
@@ -188,6 +226,23 @@ class AsyncAgentBase(ABC):
                             current_app,
                             self._user_image_attachments,
                         )
+
+                    # 首张截图就受保护：作为第 1 步暂停（上下文已建好，可继续）
+                    if getattr(screenshot, "is_sensitive", False) and is_managed_mode():
+                        self._step_count += 1
+                        paused = await self._protected_screen_step(screenshot)
+                        if paused is not None:
+                            yield paused
+                            yield {
+                                "type": "takeover",
+                                "data": {
+                                    "message": PROTECTED_SCREEN_MESSAGE,
+                                    "steps": self._step_count,
+                                    "success": True,
+                                    "stop_reason": "takeover",
+                                },
+                            }
+                            return
 
                 started_at = time.monotonic()
                 repeated_action_count = 0

@@ -109,6 +109,11 @@ class AsyncMAIAgent(AsyncAgentBase):
             }
             return
 
+        paused = await self._protected_screen_step(screenshot)
+        if paused is not None:
+            yield paused
+            return
+
         with trace_span(
             "step.build_message",
             attrs={"step": self._step_count, "agent_type": self.__class__.__name__},
