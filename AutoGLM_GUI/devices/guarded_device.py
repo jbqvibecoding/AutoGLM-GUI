@@ -60,8 +60,13 @@ class GuardedDevice:
         guarded: tuple[str, ...],
         context: str,
         action_guard: ActionGuard | None = None,
+        managed_id: str | None = None,
     ) -> None:
         self._inner = inner
+        # The id the agent manager knows this phone by. Approvals, remembered
+        # screenshots and the executor's own confirmations use it; a remote
+        # device may call itself something else.
+        self._managed_id = managed_id or inner.device_id
         self._guarded = guarded
         self._context = context
         self._action_guard = action_guard
@@ -98,7 +103,7 @@ class GuardedDevice:
         allowed = await asyncio.to_thread(
             ask_user,
             f"允许 agent 在「{name}」中操作？",
-            device_id=self.device_id,
+            device_id=self._managed_id,
             context=self._context,
             kind="app_access",
             package=package,
@@ -113,16 +118,16 @@ class GuardedDevice:
         """Ask the user first if the guard model finds the input sensitive (or can't tell)."""
         if self._action_guard is None:
             return
-        if take_input_approval(self.device_id, self._context):
+        if take_input_approval(self._managed_id, self._context):
             return  # the user just approved this very input
-        screenshot = last_screenshot(self.device_id)
+        screenshot = last_screenshot(self._managed_id)
         verdict = await self._action_guard.judge(screenshot, action)
         if not verdict.needs_approval:
             return
         allowed = await asyncio.to_thread(
             ask_user,
             approval_message(verdict, action),
-            device_id=self.device_id,
+            device_id=self._managed_id,
             context=self._context,
         )
         if not allowed:
@@ -132,7 +137,7 @@ class GuardedDevice:
 
     async def get_screenshot(self, timeout: int = 10) -> Screenshot:
         screenshot = await self._inner.get_screenshot(timeout)
-        remember_screenshot(self.device_id, screenshot)
+        remember_screenshot(self._managed_id, screenshot)
         return screenshot
 
     async def get_current_app(self) -> str:
@@ -234,4 +239,5 @@ def guard_device(
         guarded=settings.guarded_apps,
         context=agent_context(agent_key, device_id),
         action_guard=action_guard,
+        managed_id=device_id,
     )

@@ -458,3 +458,37 @@ def test_guard_device_builds_the_guard_from_the_environment(
     monkeypatch.delenv("AUTOGLM_MANAGED_MODE")
     device = _Device()
     assert guard_device(device, agent_key="phone-1", device_id="phone-1") is device  # type: ignore[arg-type]
+
+
+class _RemoteDevice(_Device):
+    """A remote device agent names itself, not by the manager's id."""
+
+    @property
+    def device_id(self) -> str:
+        return "managed-device"
+
+
+def test_the_managers_device_id_ties_flags_screens_and_approvals_together() -> None:
+    cp = _ControlPlane(["approved"])
+    _install(cp)
+    device = _RemoteDevice()
+    guard = _guard(SENSITIVE)
+    guarded = GuardedDevice(
+        device,  # type: ignore[arg-type]
+        guarded=(),
+        context="chat:s1",
+        action_guard=guard,
+        managed_id="10.0.0.2:5555",
+    )
+    confirm = managed_confirmation("10.0.0.2:5555", "chat:s1")
+
+    async def flagged_tap() -> None:
+        await guarded.get_screenshot()
+        assert await asyncio.to_thread(confirm, "确认支付 25 元")
+        await guarded.tap(540, 2100)
+
+    asyncio.run(flagged_tap())
+    assert device.calls == ["tap"]
+    (approval,) = cp.created  # not asked a second time
+    assert approval["screenshot"]  # the executor's own flag shows the screen too
+    assert _calls(guard) == []
