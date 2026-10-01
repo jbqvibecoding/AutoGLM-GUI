@@ -3,7 +3,7 @@
 import base64
 import binascii
 import re
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -95,6 +95,30 @@ class TapRequest(BaseModel):
 
 
 class TapResponse(BaseModel):
+    success: bool
+    error: str | None = None
+
+
+class KeyRequest(BaseModel):
+    """A key press from the user taking over the phone."""
+
+    device_id: str
+    key: Literal["back", "home", "enter", "delete", "app_switch"]
+
+
+class KeyResponse(BaseModel):
+    success: bool
+    error: str | None = None
+
+
+class TextRequest(BaseModel):
+    """Text typed by the user taking over the phone. Never logged."""
+
+    device_id: str
+    text: str = Field(min_length=1, max_length=2000)
+
+
+class TextResponse(BaseModel):
     success: bool
     error: str | None = None
 

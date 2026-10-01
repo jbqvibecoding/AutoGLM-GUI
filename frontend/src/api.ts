@@ -603,6 +603,36 @@ export async function sendTap(
   return res.data;
 }
 
+export type PhoneKey = 'back' | 'home' | 'enter' | 'delete' | 'app_switch';
+
+export interface ControlResponse {
+  success: boolean;
+  error?: string | null;
+}
+
+export async function sendKey(
+  deviceId: string,
+  key: PhoneKey
+): Promise<ControlResponse> {
+  const res = await axios.post<ControlResponse>('/api/control/key', {
+    device_id: deviceId,
+    key,
+  });
+  return res.data;
+}
+
+/** Types into the focused field on the phone (supports Chinese). */
+export async function sendText(
+  deviceId: string,
+  text: string
+): Promise<ControlResponse> {
+  const res = await axios.post<ControlResponse>('/api/control/text', {
+    device_id: deviceId,
+    text,
+  });
+  return res.data;
+}
+
 export async function sendSwipe(
   startX: number,
   startY: number,

@@ -533,3 +533,14 @@ async def launch_app_async(
         )
     await asyncio.sleep(delay)
     return True
+
+
+def keyevent(device_id: str | None, keycode: int) -> None:
+    """Press one key (``adb shell input keyevent``)."""
+    adb_prefix = build_adb_command(device_id)
+    with trace_span("adb.keyevent", attrs={"device_id": device_id, "keycode": keycode}):
+        subprocess.run(
+            adb_prefix + ["shell", "input", "keyevent", str(keycode)],
+            capture_output=True,
+            check=True,
+        )
