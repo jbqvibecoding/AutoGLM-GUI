@@ -316,6 +316,8 @@ class UnifiedConfigManager:
         - AUTOGLM_DECISION_API_KEY
         - AUTOGLM_DEFAULT_MAX_STEPS
         - AUTOGLM_LAYERED_MAX_TURNS
+        - AUTOGLM_AGENT_TYPE
+        - AUTOGLM_AGENT_CONFIG_PARAMS（JSON 对象）
         """
         base_url = os.getenv("AUTOGLM_BASE_URL")
         model_name = os.getenv("AUTOGLM_MODEL_NAME")
@@ -342,6 +344,19 @@ class UnifiedConfigManager:
             except ValueError:
                 logger.warning("AUTOGLM_LAYERED_MAX_TURNS must be an integer")
 
+        agent_type = os.getenv("AUTOGLM_AGENT_TYPE") or None
+        agent_config_params = None
+        agent_config_params_str = os.getenv("AUTOGLM_AGENT_CONFIG_PARAMS")
+        if agent_config_params_str:
+            try:
+                parsed = json.loads(agent_config_params_str)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, dict):
+                agent_config_params = parsed
+            else:
+                logger.warning("AUTOGLM_AGENT_CONFIG_PARAMS must be a JSON object")
+
         env_values = {
             "base_url": base_url if base_url else None,
             "model_name": model_name if model_name else None,
@@ -351,6 +366,8 @@ class UnifiedConfigManager:
             "decision_base_url": decision_base_url if decision_base_url else None,
             "decision_model_name": decision_model_name if decision_model_name else None,
             "decision_api_key": decision_api_key if decision_api_key else None,
+            "agent_type": agent_type,
+            "agent_config_params": agent_config_params,
         }
         self._env_layer = ConfigLayer(
             **env_values,

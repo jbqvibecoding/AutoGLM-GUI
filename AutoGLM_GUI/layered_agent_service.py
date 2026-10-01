@@ -9,7 +9,7 @@ import json
 import threading
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from agents import Agent, Runner, SQLiteSession, function_tool
 from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
@@ -78,6 +78,19 @@ PLANNER_INSTRUCTIONS = """## 核心目标
    - 发送操作指令（如"点击红色按钮"）。
    - 发送查询问题（如"那个验证码是多少？"）。
 """
+
+ARTEMIS_INSTRUCTIONS = """
+## 高级执行器 Artemis
+`chat` 还有一个参数 `executor`，默认 `"phone"`（上面说的视觉模型，一次一个动作）。
+设为 `"artemis"` 时，整段子任务会交给高级执行器 Artemis：它会自己多步操作、跨 App 完成任务并核对结果，结束后返回结果说明。
+- 适合：步骤多、要在几个 App 之间来回、需要核对结果的子任务（如"在 App A 查到订单号后到 App B 提交售后"）。
+- 不适合：单步操作、读屏问答，这些用 `"phone"` 更快。
+- 给 Artemis 的 `message` 写成完整目标，包含要完成什么、完成的判断标准，而不是单个点击。
+- 涉及支付、银行类 App 时，Artemis 会先请用户批准；用户拒绝后它会停止，不要换方式重试。
+"""
+
+#: Agent key context for the Artemis executor (separate from the phone agent).
+ARTEMIS_CONTEXT = "layered-artemis"
 
 
 class TracedSQLiteSession(SQLiteSession):
@@ -245,10 +258,15 @@ async def list_devices() -> str:
 
 
 @function_tool
-async def chat(device_id: str, message: str) -> str:
+async def chat(
+    device_id: str, message: str, executor: Literal["phone", "artemis"] = "phone"
+) -> str:
     from AutoGLM_GUI.exceptions import DeviceBusyError
     from AutoGLM_GUI.phone_agent_manager import PhoneAgentManager
     from AutoGLM_GUI.prompts import MCP_SYSTEM_PROMPT_ZH
+
+    if executor == "artemis":
+        return await _chat_artemis(device_id, message)
 
     mcp_max_steps = 5
 
@@ -379,6 +397,78 @@ async def chat(device_id: str, message: str) -> str:
                     )
 
 
+async def _chat_artemis(device_id: str, message: str) -> str:
+    """Hand a whole sub-task to the Artemis executor and wait for its result."""
+    from AutoGLM_GUI.agents.artemis.async_agent import artemis_endpoint
+    from AutoGLM_GUI.exceptions import DeviceBusyError
+    from AutoGLM_GUI.managed import forward_approval_event
+    from AutoGLM_GUI.phone_agent_manager import PhoneAgentManager
+
+    def reply(result: str, steps: int, success: bool) -> str:
+        return json.dumps(
+            {"result": result, "steps": steps, "success": success},
+            ensure_ascii=False,
+        )
+
+    if artemis_endpoint() is None:
+        return reply('Artemis 执行器未启用，请改用 executor="phone"。', 0, False)
+
+    with trace_span(
+        "layered.tool.chat",
+        attrs={
+            "device_id": device_id,
+            "executor": "artemis",
+            "task_preview": summarize_text(message) or "",
+            "task_length": len(message),
+        },
+    ) as tool_span:
+        manager = PhoneAgentManager.get_instance()
+        acquired = False
+        try:
+            agent = await manager.get_agent_with_context_async(
+                device_id, context=ARTEMIS_CONTEXT, agent_type="artemis"
+            )
+            acquired = await manager.acquire_device_async(
+                device_id, context=ARTEMIS_CONTEXT
+            )
+            agent.reset()
+            result, success = "", False
+            async for event in agent.stream(message):
+                kind = event["type"]
+                if kind in ("approval_required", "approval_resolved"):
+                    forward_approval_event(kind, event["data"])
+                elif kind in ("done", "error", "cancelled"):
+                    result = str(event["data"].get("message", ""))
+                    success = kind == "done" and bool(event["data"].get("success"))
+            tool_span.set_attributes({"success": success, "steps": agent.step_count})
+            return reply(result, agent.step_count, success)
+        except DeviceBusyError:
+            tool_span.set_attributes({"success": False, "error_kind": "busy"})
+            return reply(f"设备 {device_id} 正忙，请稍后再试。", 0, False)
+        except Exception as exc:
+            tool_span.set_attributes({"success": False, "error_kind": "unexpected"})
+            logger.error(f"[LayeredAgent] artemis chat error: {exc}")
+            return reply(str(exc), 0, False)
+        finally:
+            if acquired:
+                try:
+                    await manager.release_device_async(
+                        device_id, context=ARTEMIS_CONTEXT
+                    )
+                except BaseException as exc:  # pragma: no cover - safety net
+                    logger.error(
+                        f"Failed to release device lock for {device_id}: {exc}"
+                    )
+
+
+def planner_instructions() -> str:
+    from AutoGLM_GUI.agents.artemis.async_agent import artemis_endpoint
+
+    if artemis_endpoint() is None:
+        return PLANNER_INSTRUCTIONS
+    return PLANNER_INSTRUCTIONS + ARTEMIS_INSTRUCTIONS
+
+
 def _create_planner_agent(client: AsyncOpenAI) -> Agent[Any]:
     planner_model = get_planner_model()
     model = OpenAIChatCompletionsModel(
@@ -388,7 +478,7 @@ def _create_planner_agent(client: AsyncOpenAI) -> Agent[Any]:
 
     return Agent(
         name="Planner",
-        instructions=PLANNER_INSTRUCTIONS,
+        instructions=planner_instructions(),
         model=model,
         tools=[list_devices, chat],
     )

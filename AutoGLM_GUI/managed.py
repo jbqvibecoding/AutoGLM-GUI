@@ -576,6 +576,15 @@ def _append_task_event(
         logger.exception(f"[Managed] Could not record {event_type} for task {task_id}")
 
 
+def forward_approval_event(event_type: str, payload: dict[str, Any]) -> None:
+    """Record an executor's approval event on the running task (best effort).
+
+    Executors that ask the user themselves (Artemis) report their approvals
+    as events; this shows them in the task's chat like the runtime's own.
+    """
+    _append_task_event(_current_task_id(), event_type, payload)
+
+
 # The last screen each device showed the agent, attached to approvals so the
 # user sees what the agent is about to act on.
 _last_screenshots: dict[str, Screenshot] = {}
