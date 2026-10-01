@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 from collections.abc import Iterator
+import json
 from pathlib import Path
 
 import pytest
@@ -122,6 +123,35 @@ def test_config_hides_platform_keys(
     assert body["api_key"] == "********"
     assert "sk-user-secret-key" not in resp.text
     assert body["base_url"] == "http://gateway:4000/v1"
+
+
+def test_config_conflicts_hide_keys_too(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from AutoGLM_GUI.config_manager import config_manager
+
+    # A config file left on the runtime disagrees with the platform's settings;
+    # the conflict report must not show either key.
+    stale = tmp_path / "config.json"
+    stale.write_text(
+        json.dumps({"base_url": "http://old/v1", "api_key": "sk-stale-file-key"})
+    )
+    for attr in ("_config_path", "_file_layer", "_file_cache", "_file_mtime"):
+        monkeypatch.setattr(config_manager, attr, getattr(config_manager, attr))
+    monkeypatch.setattr(config_manager, "_config_path", stale)
+    monkeypatch.setattr(config_manager, "_env_layer", config_manager._env_layer)
+    monkeypatch.setattr(config_manager, "_effective_config", None)
+    config_manager.load_env_config()
+
+    resp = client.get("/api/config", headers=AUTH)
+    assert resp.status_code == 200
+    assert "sk-user-secret-key" not in resp.text
+    assert "sk-stale-file-key" not in resp.text
+    conflicts = {c["field"]: c for c in resp.json()["conflicts"]}
+    assert conflicts["api_key"]["file_value"] == "********"
+    assert conflicts["api_key"]["override_value"] == "********"
+    # Other fields are still reported as they are.
+    assert conflicts["base_url"]["file_value"] == "http://old/v1"
 
 
 def test_websocket_without_token_is_rejected(client: TestClient) -> None:

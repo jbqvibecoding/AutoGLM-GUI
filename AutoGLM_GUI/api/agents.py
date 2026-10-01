@@ -219,10 +219,17 @@ def get_config_endpoint() -> ConfigResponse:
 
     api_key = effective_config.api_key if effective_config.api_key != "EMPTY" else ""
     decision_api_key = effective_config.decision_api_key
-    if is_managed_mode():
+    managed = is_managed_mode()
+    if managed:
         # Managed runtimes get platform-issued keys; never echo them to the browser.
         api_key = _MASKED_KEY if api_key else ""
         decision_api_key = _MASKED_KEY if decision_api_key else decision_api_key
+
+    def shown(field: str, value: Any) -> Any:
+        # Conflicts list both sides of an override, keys included.
+        if managed and field == "api_key" and value:
+            return _MASKED_KEY
+        return value
 
     return ConfigResponse(
         base_url=effective_config.base_url,
@@ -239,8 +246,8 @@ def get_config_endpoint() -> ConfigResponse:
         conflicts=[
             {
                 "field": c.field,
-                "file_value": c.file_value,
-                "override_value": c.override_value,
+                "file_value": shown(c.field, c.file_value),
+                "override_value": shown(c.field, c.override_value),
                 "override_source": c.override_source.value,
             }
             for c in conflicts
