@@ -95,3 +95,9 @@ class AgentInitializationError(Exception):
     """
 
     pass
+
+
+class ActionDeniedError(Exception):
+    """The user did not allow an action (managed mode). Ends the task."""
+
+    pass

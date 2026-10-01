@@ -34,14 +34,17 @@ local installation.
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from io import BytesIO
 from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from AutoGLM_GUI.device_protocol import Screenshot
 from AutoGLM_GUI.logger import logger
 
 if TYPE_CHECKING:
@@ -79,6 +82,9 @@ class ManagedSettings:
     device_remote_id: str = DEFAULT_REMOTE_DEVICE_ID
     control_plane_url: str | None = None
     internal_token: str | None = None
+    # Package prefixes (e.g. "com.eg.android.AlipayGphone") the agent may only
+    # act in after the user allows it; see devices/guarded_device.py.
+    guarded_apps: tuple[str, ...] = ()
 
 
 def _clean(value: str | None) -> str | None:
@@ -136,7 +142,13 @@ def load_managed_settings(env: Mapping[str, str] | None = None) -> ManagedSettin
         or DEFAULT_REMOTE_DEVICE_ID,
         control_plane_url=_clean(env.get("AUTOGLM_CONTROL_PLANE_URL")),
         internal_token=internal_token,
+        guarded_apps=parse_guarded_apps(env.get("AUTOGLM_GUARDED_APPS")),
     )
+
+
+def parse_guarded_apps(raw: str | None) -> tuple[str, ...]:
+    """``"com.a, com.b"`` -> ``("com.a", "com.b")``."""
+    return tuple(p.strip() for p in (raw or "").split(",") if p.strip())
 
 
 def is_managed_mode(env: Mapping[str, str] | None = None) -> bool:
@@ -309,23 +321,35 @@ class ApprovalClient:
         *,
         device_id: str,
         context: str,
+        kind: str = "action",
+        package: str | None = None,
+        app_name: str | None = None,
+        screenshot: str | None = None,
         on_created: Callable[[str], None] | None = None,
     ) -> str:
         """Block until the user decides.
 
+        ``screenshot`` is a base64 JPEG of the screen the agent acts on. For
+        ``kind="app_access"`` the control plane may answer at once from a
+        grant the user gave earlier.
+
         Returns ``approved``, ``denied``, ``expired`` or ``error``; anything
         but ``approved`` must be treated as a refusal.
         """
+        body: dict[str, Any] = {
+            "message": message,
+            "device_id": device_id,
+            "context": context,
+            "kind": kind,
+        }
+        if package is not None:
+            body["package"] = package
+            body["app_name"] = app_name or package
+        if screenshot is not None:
+            body["screenshot"] = screenshot
         with self._client() as client:
             try:
-                resp = client.post(
-                    "/internal/runtime/approvals",
-                    json={
-                        "message": message,
-                        "device_id": device_id,
-                        "context": context,
-                    },
-                )
+                resp = client.post("/internal/runtime/approvals", json=body)
             except httpx.HTTPError as exc:
                 logger.error(f"[Managed] Approval request failed: {exc}")
                 return "error"
@@ -335,6 +359,8 @@ class ApprovalClient:
                 )
                 return "error"
             approval = resp.json()
+            if approval.get("status") in APPROVAL_STATUSES:
+                return str(approval["status"])  # decided already (standing grant)
             approval_id = str(approval["id"])
             deadline = (
                 self._clock()
@@ -550,6 +576,102 @@ def _append_task_event(
         logger.exception(f"[Managed] Could not record {event_type} for task {task_id}")
 
 
+# The last screen each device showed the agent, attached to approvals so the
+# user sees what the agent is about to act on.
+_last_screenshots: dict[str, Screenshot] = {}
+
+THUMBNAIL_WIDTH = 540
+THUMBNAIL_QUALITY = 60
+
+
+def remember_screenshot(device_id: str, screenshot: Screenshot) -> None:
+    _last_screenshots[device_id] = screenshot
+
+
+def last_screenshot(device_id: str) -> Screenshot | None:
+    return _last_screenshots.get(device_id)
+
+
+def jpeg_thumbnail(
+    screenshot: Screenshot | None,
+    width: int = THUMBNAIL_WIDTH,
+    quality: int = THUMBNAIL_QUALITY,
+) -> str | None:
+    """A small base64 JPEG of ``screenshot`` for an approval, or None."""
+    if screenshot is None or not screenshot.base64_data:
+        return None
+    try:
+        from PIL import Image
+
+        img = Image.open(BytesIO(base64.b64decode(screenshot.base64_data)))
+        img = img.convert("RGB")
+        if img.width > width:
+            img = img.resize((width, max(1, round(img.height * width / img.width))))
+        out = BytesIO()
+        img.save(out, format="JPEG", quality=quality)
+        return base64.b64encode(out.getvalue()).decode("ascii")
+    except Exception:
+        logger.warning("[Managed] Could not make an approval thumbnail", exc_info=True)
+        return None
+
+
+def ask_user(
+    message: str,
+    *,
+    device_id: str,
+    context: str,
+    kind: str = "action",
+    package: str | None = None,
+    app_name: str | None = None,
+) -> bool:
+    """Ask the user through the control plane and block until they decide.
+
+    Attaches the last screen the agent saw and records the wait on the
+    running task. Denies when there is no control plane, on errors and on
+    expiry. Call from a worker thread.
+    """
+    runtime = _managed_runtime
+    if runtime is None or runtime.approvals is None:
+        logger.error(f"[Managed] No control plane to approve {message!r}; denied")
+        return False
+
+    task_id = _current_task_id()
+    approval_id: str | None = None
+
+    def created(new_id: str) -> None:
+        nonlocal approval_id
+        approval_id = new_id
+        _append_task_event(
+            task_id,
+            "approval_required",
+            {"approval_id": new_id, "message": message},
+        )
+
+    try:
+        status = runtime.approvals.request(
+            message,
+            device_id=device_id,
+            context=context,
+            kind=kind,
+            package=package,
+            app_name=app_name,
+            screenshot=jpeg_thumbnail(last_screenshot(device_id)),
+            on_created=created,
+        )
+    except Exception:
+        # e.g. a malformed reply: fail closed like any other error
+        logger.exception("[Managed] Approval request crashed; denied")
+        status = "error"
+    if approval_id is not None:
+        _append_task_event(
+            task_id,
+            "approval_resolved",
+            {"approval_id": approval_id, "status": status},
+        )
+    logger.info(f"[Managed] Approval ({kind}) for {message!r}: {status}")
+    return status == "approved"
+
+
 def managed_confirmation(device_id: str, context: str) -> Callable[[str], bool]:
     """Confirmation callback that asks the user through the control plane.
 
@@ -558,39 +680,7 @@ def managed_confirmation(device_id: str, context: str) -> Callable[[str], bool]:
     """
 
     def confirm(message: str) -> bool:
-        runtime = _managed_runtime
-        if runtime is None or runtime.approvals is None:
-            logger.error(f"[Managed] No control plane to approve {message!r}; denied")
-            return False
-
-        task_id = _current_task_id()
-        approval_id: str | None = None
-
-        def created(new_id: str) -> None:
-            nonlocal approval_id
-            approval_id = new_id
-            _append_task_event(
-                task_id,
-                "approval_required",
-                {"approval_id": new_id, "message": message},
-            )
-
-        try:
-            status = runtime.approvals.request(
-                message, device_id=device_id, context=context, on_created=created
-            )
-        except Exception:
-            # e.g. a malformed reply: fail closed like any other error
-            logger.exception("[Managed] Approval request crashed; denied")
-            status = "error"
-        if approval_id is not None:
-            _append_task_event(
-                task_id,
-                "approval_resolved",
-                {"approval_id": approval_id, "status": status},
-            )
-        logger.info(f"[Managed] Approval for {message!r}: {status}")
-        return status == "approved"
+        return ask_user(message, device_id=device_id, context=context)
 
     return confirm
 

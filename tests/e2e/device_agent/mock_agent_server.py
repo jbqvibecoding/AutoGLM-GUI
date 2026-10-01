@@ -50,6 +50,8 @@ class MockAgentState:
         # Simulates a protected (FLAG_SECURE) screen: screenshots report
         # is_sensitive, as a real device's black capture would.
         self.sensitive = False
+        # Overrides the foreground app the agent reports (e.g. a guarded app).
+        self.current_app_override: str | None = None
         self.scenario_path: str | None = None
         self.available_devices: list[dict] = [
             {
@@ -72,9 +74,10 @@ class MockAgentState:
         )
 
     def reset(self):
-        """Reset command history and the protected-screen switch."""
+        """Reset command history and the test overrides."""
         self.commands = []
         self.sensitive = False
+        self.current_app_override = None
 
     def load_scenario(self, path: str | Path):
         """Load a test scenario (state machine)."""
@@ -102,6 +105,8 @@ class MockAgentState:
 
     def get_current_app(self) -> str:
         """Get current app from state machine."""
+        if self.current_app_override:
+            return self.current_app_override
         if self.state_machine:
             return self.state_machine.current_state.current_app
         return "com.mock.app"
@@ -112,6 +117,10 @@ class MockAgentState:
 
 
 state = MockAgentState()
+
+
+class CurrentAppRequest(BaseModel):
+    app: str | None = None
 
 
 class SensitiveRequest(BaseModel):
@@ -301,6 +310,12 @@ def _register_routes(app: FastAPI):
         """Reset command history."""
         state.reset()
         return {"status": "reset", "commands_cleared": True}
+
+    @app.post("/test/current_app")
+    async def set_current_app(req: CurrentAppRequest):
+        """Override the foreground app reported to the agent (None to clear)."""
+        state.current_app_override = req.app
+        return {"app": state.current_app_override}
 
     @app.post("/test/sensitive")
     async def set_sensitive(req: SensitiveRequest):

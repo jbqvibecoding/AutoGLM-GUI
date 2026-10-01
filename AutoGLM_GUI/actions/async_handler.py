@@ -6,6 +6,7 @@ from collections.abc import Callable
 
 from AutoGLM_GUI.adb.timing import TIMING_CONFIG
 from AutoGLM_GUI.device_protocol import AsyncDeviceProtocol
+from AutoGLM_GUI.exceptions import ActionDeniedError
 from AutoGLM_GUI.trace import trace_sleep_async, trace_span
 
 from .types import ActionResult
@@ -94,6 +95,16 @@ class AsyncActionHandler:
 
             try:
                 result = await handler_method(action, screen_width, screen_height)
+                span.set_attributes(
+                    {
+                        "success": result.success,
+                        "should_finish": result.should_finish,
+                    }
+                )
+                return result
+            except ActionDeniedError as e:
+                # The user refused (managed mode): stop the task, don't retry.
+                result = ActionResult(success=False, should_finish=True, message=str(e))
                 span.set_attributes(
                     {
                         "success": result.success,

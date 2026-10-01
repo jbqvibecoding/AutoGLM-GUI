@@ -182,6 +182,10 @@ class ADBDevice(DeviceProtocol):
             span.set_attribute("current_app", current_app)
             return current_app
 
+    def get_current_package(self) -> str | None:
+        """Package name of the foreground app (None if unknown)."""
+        return adb.get_current_package(self._device_id)
+
     # === Keyboard Management ===
     def detect_and_set_adb_keyboard(self) -> str:
         """Detect current keyboard and switch to ADB Keyboard if needed."""
@@ -460,6 +464,10 @@ class AsyncADBDevice(AsyncDeviceProtocol):
             current_app = await adb.get_current_app_async(self._device_id)
             span.set_attribute("current_app", current_app)
             return current_app
+
+    async def get_current_package(self) -> str | None:
+        """Package name of the foreground app (None if unknown)."""
+        return await adb.get_current_package_async(self._device_id)
 
     async def detect_and_set_adb_keyboard(self) -> str:
         with trace_span(
