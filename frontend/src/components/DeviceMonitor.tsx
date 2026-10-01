@@ -1,5 +1,6 @@
 import React, { useRef, useEffect, useCallback, useState } from 'react';
 import { ScrcpyPlayer } from './ScrcpyPlayer';
+import { PhoneControlBar } from './PhoneControlBar';
 import { WidthControl } from './WidthControl';
 import { ResizableHandle } from './ResizableHandle';
 import { useLocalStorage } from '../hooks/useLocalStorage';
@@ -306,9 +307,19 @@ export function DeviceMonitor({
         </Badge>
       </div>
 
-      {/* Feedback message */}
+      {/* Keys and text input for taking over the phone */}
+      <PhoneControlBar
+        deviceId={deviceId}
+        isRemoteDevice={isRemoteDevice}
+        visible={showControlArea}
+        onResult={(message, isError) =>
+          showFeedback(message, 2000, isError ? 'error' : 'success')
+        }
+      />
+
+      {/* Feedback message (above the control bar) */}
       {feedbackMessage && (
-        <div className="absolute bottom-4 right-4 z-20 flex items-center gap-2 px-3 py-2 bg-[#1d9bf0] text-white text-sm rounded-xl shadow-lg">
+        <div className="absolute bottom-16 right-4 z-20 flex items-center gap-2 px-3 py-2 bg-[#1d9bf0] text-white text-sm rounded-xl shadow-lg">
           {feedbackType === 'error' && <AlertCircle className="w-4 h-4" />}
           {feedbackType === 'tap' && <Fingerprint className="w-4 h-4" />}
           {feedbackType === 'swipe' && <ArrowUpDown className="w-4 h-4" />}
