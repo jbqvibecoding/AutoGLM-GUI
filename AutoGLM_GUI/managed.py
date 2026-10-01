@@ -398,7 +398,13 @@ class ApprovalClient:
             return str(approval["status"])
 
     def report_event(
-        self, kind: str, message: str, *, device_id: str, context: str
+        self,
+        kind: str,
+        message: str,
+        *,
+        device_id: str,
+        context: str,
+        **fields: Any,
     ) -> None:
         """Best effort: tell the control plane (and so the user) what happened."""
         try:
@@ -410,6 +416,7 @@ class ApprovalClient:
                         "message": message,
                         "device_id": device_id,
                         "context": context,
+                        **fields,
                     },
                     timeout=5.0,
                 )
@@ -692,6 +699,46 @@ def managed_confirmation(device_id: str, context: str) -> Callable[[str], bool]:
         return ask_user(message, device_id=device_id, context=context)
 
     return confirm
+
+
+TASK_TITLE_LENGTH = 60
+TASK_MESSAGE_LENGTH = 2000
+# Stops the user already knows about: a takeover was reported when it
+# happened, and a user who cancelled a task does not need telling.
+_SILENT_STOPS = {"takeover", "user_stopped"}
+
+
+def report_task_finished(
+    task_id: str,
+    *,
+    status: str,
+    message: str,
+    stop_reason: str | None,
+    duration_ms: int,
+) -> None:
+    """Tell the control plane a task ended; it decides whether to notify.
+
+    Best effort, and blocking: call from a worker thread.
+    """
+    runtime = _managed_runtime
+    if runtime is None or runtime.approvals is None or stop_reason in _SILENT_STOPS:
+        return
+    from AutoGLM_GUI.task_store import task_store
+
+    task = task_store.get_task(task_id)
+    if task is None:
+        return
+    title = " ".join(str(task.get("input_text") or "").split())[:TASK_TITLE_LENGTH]
+    runtime.approvals.report_event(
+        "task_finished",
+        message[:TASK_MESSAGE_LENGTH],
+        device_id=str(task.get("device_id") or ""),
+        context=f"task:{task_id}",
+        status=status,
+        source=str(task.get("source") or ""),
+        duration_seconds=round(max(duration_ms, 0) / 1000, 1),
+        title=title,
+    )
 
 
 def managed_takeover(device_id: str, context: str) -> Callable[[str], None]:

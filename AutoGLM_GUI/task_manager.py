@@ -9,6 +9,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any, cast
 
 from AutoGLM_GUI.logger import logger
+from AutoGLM_GUI.managed import is_managed_mode, report_task_finished
 from AutoGLM_GUI.metrics import record_trace_latency_metrics
 from AutoGLM_GUI.task_store import (
     TERMINAL_TASK_STATUSES,
@@ -39,6 +40,7 @@ class TaskManager:
         self._executors: dict[str, TaskExecutor] = {}
         self._started = False
         self._takeover_sessions: dict[str, bool] = {}
+        self._reports: set[asyncio.Task[None]] = set()
         self._shutdown = False
         self.register_executor("classic_chat", self._execute_classic_chat)
         self.register_executor("layered_chat", self._execute_layered_chat)
@@ -437,6 +439,37 @@ class TaskManager:
                 self._mark_task_complete(task_id)
         finally:
             trace_module.clear_trace_data(trace_id)
+        if is_managed_mode():
+            self._report_finished(
+                task_id, status, final_message, stop_reason, total_duration_ms
+            )
+
+    def _report_finished(
+        self,
+        task_id: str,
+        status: str,
+        final_message: str,
+        stop_reason: str | None,
+        duration_ms: int,
+    ) -> None:
+        """Managed mode: let the control plane notify the user, in the background."""
+
+        async def report() -> None:
+            try:
+                await asyncio.to_thread(
+                    report_task_finished,
+                    task_id,
+                    status=status,
+                    message=final_message,
+                    stop_reason=stop_reason,
+                    duration_ms=duration_ms,
+                )
+            except Exception:
+                logger.exception(f"[Managed] Could not report task {task_id}")
+
+        task = asyncio.create_task(report())
+        self._reports.add(task)
+        task.add_done_callback(self._reports.discard)
 
     async def _device_worker(self, device_id: str) -> None:
         try:
