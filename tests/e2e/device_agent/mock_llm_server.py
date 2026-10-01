@@ -47,12 +47,23 @@ finish(message="已成功点击消息按钮！现在进入了消息页面，可�
 ]
 
 
+# Requests for this model are the managed-mode action guard (see
+# AutoGLM_GUI/devices/action_guard.py): they get the configured verdict, and
+# do not consume or count against the scripted executor responses.
+GUARD_MODEL = "mock-guard-model"
+HARMLESS_VERDICT = json.dumps(
+    {"sensitive": False, "category": "none", "target": "", "reason": ""}
+)
+
+
 @dataclass
 class MockLLMState:
     """Global state for the mock LLM server."""
 
     request_count: int = 0
     responses: list[str] = field(default_factory=lambda: DEFAULT_RESPONSES.copy())
+    guard_verdict: str = HARMLESS_VERDICT
+    guard_request_count: int = 0
 
     def get_next_response(self) -> str:
         """Get next response in round-robin fashion."""
@@ -64,8 +75,10 @@ class MockLLMState:
         return self.responses[idx]
 
     def reset(self) -> None:
-        """Reset request count."""
+        """Reset request counts and the guard verdict."""
         self.request_count = 0
+        self.guard_request_count = 0
+        self.guard_verdict = HARMLESS_VERDICT
 
     def set_responses(self, responses: list[str]) -> None:
         """Override predefined responses."""
@@ -126,6 +139,24 @@ async def stream_response(content: str) -> AsyncGenerator[str, None]:
     yield "data: [DONE]\n\n"
 
 
+def guard_completion(content: str) -> dict:
+    """A non-streaming chat completion for the action guard."""
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": GUARD_MODEL,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+    }
+
+
 def create_app() -> FastAPI:
     """Create the FastAPI app."""
     app = FastAPI(
@@ -145,8 +176,8 @@ def _register_routes(app: FastAPI) -> None:
     async def chat_completions(req: ChatRequest):
         """OpenAI-compatible chat completions endpoint."""
 
-        # Validate streaming requirement
-        if not req.stream:
+        # Validate streaming requirement (the guard model answers in one piece)
+        if not req.stream and req.model != GUARD_MODEL:
             raise HTTPException(
                 status_code=400, detail="Only streaming mode is supported"
             )
@@ -154,6 +185,10 @@ def _register_routes(app: FastAPI) -> None:
         # Validate messages array
         if not req.messages:
             raise HTTPException(status_code=400, detail="Messages array is required")
+
+        if req.model == GUARD_MODEL:
+            state.guard_request_count += 1
+            return guard_completion(state.guard_verdict)
 
         # Get next response
         response_text = state.get_next_response()
@@ -173,7 +208,16 @@ def _register_routes(app: FastAPI) -> None:
         return {
             "request_count": state.request_count,
             "total_responses": len(state.responses),
+            "guard_request_count": state.guard_request_count,
         }
+
+    @app.post("/test/guard_verdict")
+    async def set_guard_verdict(verdict: dict):
+        """Set what the action guard answers: a verdict object, or {"text": raw}."""
+        state.guard_verdict = (
+            str(verdict["text"]) if "text" in verdict else json.dumps(verdict)
+        )
+        return {"status": "updated"}
 
     @app.post("/test/reset")
     async def reset():

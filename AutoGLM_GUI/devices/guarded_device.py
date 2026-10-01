@@ -9,8 +9,16 @@ the current task; the control plane may also answer from a grant the user made
 permanent ("always allow"). A refusal raises :class:`ActionDeniedError`, which
 ends the task.
 
+Outside guarded apps, every input that can commit something (tap, double tap,
+long press, swipe) is first shown to an independent guard model, which only
+says whether it pays, buys, sends, posts, deletes, changes account security or
+authorizes something (``devices/action_guard.py``). If it does, or if the
+guard cannot tell, the user is asked; a refusal also ends the task. An input
+the user just approved because the executor flagged it is not asked about
+twice.
+
 It also remembers the last screenshot so approvals can show the user what the
-agent is looking at.
+agent is looking at, and so the guard sees the screen the agent acted on.
 """
 
 from __future__ import annotations
@@ -19,13 +27,20 @@ import asyncio
 
 from AutoGLM_GUI.adb.apps import get_app_name
 from AutoGLM_GUI.device_protocol import AsyncDeviceProtocol, Screenshot
+from AutoGLM_GUI.devices.action_guard import (
+    ActionGuard,
+    InputAction,
+    approval_message,
+)
 from AutoGLM_GUI.exceptions import ActionDeniedError
 from AutoGLM_GUI.logger import logger
 from AutoGLM_GUI.managed import (
     ask_user,
     is_managed_mode,
+    last_screenshot,
     load_managed_settings,
     remember_screenshot,
+    take_input_approval,
 )
 from AutoGLM_GUI.trace import current_trace_id
 
@@ -44,10 +59,17 @@ class GuardedDevice:
         *,
         guarded: tuple[str, ...],
         context: str,
+        action_guard: ActionGuard | None = None,
+        managed_id: str | None = None,
     ) -> None:
         self._inner = inner
+        # The id the agent manager knows this phone by. Approvals, remembered
+        # screenshots and the executor's own confirmations use it; a remote
+        # device may call itself something else.
+        self._managed_id = managed_id or inner.device_id
         self._guarded = guarded
         self._context = context
+        self._action_guard = action_guard
         self._grants: set[tuple[str, str]] = set()
 
     @property
@@ -81,7 +103,7 @@ class GuardedDevice:
         allowed = await asyncio.to_thread(
             ask_user,
             f"允许 agent 在「{name}」中操作？",
-            device_id=self.device_id,
+            device_id=self._managed_id,
             context=self._context,
             kind="app_access",
             package=package,
@@ -92,11 +114,30 @@ class GuardedDevice:
         logger.info(f"[Managed] Agent allowed in {package} for this task")
         self._grants.add(grant)
 
+    async def _judge(self, action: InputAction) -> None:
+        """Ask the user first if the guard model finds the input sensitive (or can't tell)."""
+        if self._action_guard is None:
+            return
+        if take_input_approval(self._managed_id, self._context):
+            return  # the user just approved this very input
+        screenshot = last_screenshot(self._managed_id)
+        verdict = await self._action_guard.judge(screenshot, action)
+        if not verdict.needs_approval:
+            return
+        allowed = await asyncio.to_thread(
+            ask_user,
+            approval_message(verdict, action),
+            device_id=self._managed_id,
+            context=self._context,
+        )
+        if not allowed:
+            raise ActionDeniedError("用户未允许这一步操作")
+
     # ---------------------------------------------------------- read access
 
     async def get_screenshot(self, timeout: int = 10) -> Screenshot:
         screenshot = await self._inner.get_screenshot(timeout)
-        remember_screenshot(self.device_id, screenshot)
+        remember_screenshot(self._managed_id, screenshot)
         return screenshot
 
     async def get_current_app(self) -> str:
@@ -106,16 +147,19 @@ class GuardedDevice:
 
     async def tap(self, x: int, y: int, delay: float | None = None) -> None:
         await self._check()
+        await self._judge(InputAction("tap", x, y))
         await self._inner.tap(x, y, delay)
 
     async def double_tap(self, x: int, y: int, delay: float | None = None) -> None:
         await self._check()
+        await self._judge(InputAction("double_tap", x, y))
         await self._inner.double_tap(x, y, delay)
 
     async def long_press(
         self, x: int, y: int, duration_ms: int = 3000, delay: float | None = None
     ) -> None:
         await self._check()
+        await self._judge(InputAction("long_press", x, y))
         await self._inner.long_press(x, y, duration_ms, delay)
 
     async def swipe(
@@ -128,6 +172,7 @@ class GuardedDevice:
         delay: float | None = None,
     ) -> None:
         await self._check()
+        await self._judge(InputAction("swipe", start_x, start_y, end_x, end_y))
         await self._inner.swipe(start_x, start_y, end_x, end_y, duration_ms, delay)
 
     async def type_text(self, text: str) -> None:
@@ -172,7 +217,27 @@ def guard_device(
     """Wrap ``device`` in managed mode; return it unchanged otherwise."""
     if not is_managed_mode():
         return device
-    guarded = load_managed_settings().guarded_apps
+    settings = load_managed_settings()
+    action_guard = None
+    if (
+        settings.action_guard_model
+        and settings.model_base_url
+        and settings.model_api_key
+    ):
+        action_guard = ActionGuard(
+            model=settings.action_guard_model,
+            base_url=settings.model_base_url,
+            api_key=settings.model_api_key,
+        )
+    else:
+        logger.warning(
+            "[Managed] No AUTOGLM_ACTION_GUARD_MODEL: only the executor model "
+            "decides which inputs outside guarded apps need approval"
+        )
     return GuardedDevice(
-        device, guarded=guarded, context=agent_context(agent_key, device_id)
+        device,
+        guarded=settings.guarded_apps,
+        context=agent_context(agent_key, device_id),
+        action_guard=action_guard,
+        managed_id=device_id,
     )

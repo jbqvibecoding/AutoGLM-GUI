@@ -85,6 +85,11 @@ class ManagedSettings:
     # Package prefixes (e.g. "com.eg.android.AlipayGphone") the agent may only
     # act in after the user allows it; see devices/guarded_device.py.
     guarded_apps: tuple[str, ...] = ()
+    # Vision model that checks each committing input on its own (see
+    # devices/action_guard.py), reached like the executor model.
+    action_guard_model: str | None = None
+    model_base_url: str | None = None
+    model_api_key: str | None = None
 
 
 def _clean(value: str | None) -> str | None:
@@ -134,6 +139,15 @@ def load_managed_settings(env: Mapping[str, str] | None = None) -> ManagedSettin
             f"(at least {MIN_INTERNAL_TOKEN_LENGTH} characters)"
         )
 
+    action_guard_model = _clean(env.get("AUTOGLM_ACTION_GUARD_MODEL"))
+    model_base_url = _clean(env.get("AUTOGLM_BASE_URL"))
+    model_api_key = _clean(env.get("AUTOGLM_API_KEY"))
+    if action_guard_model and not (model_base_url and model_api_key):
+        raise ValueError(
+            "Managed mode: AUTOGLM_ACTION_GUARD_MODEL needs AUTOGLM_BASE_URL and "
+            "AUTOGLM_API_KEY"
+        )
+
     return ManagedSettings(
         enabled=True,
         device_serial=device_serial,
@@ -143,6 +157,9 @@ def load_managed_settings(env: Mapping[str, str] | None = None) -> ManagedSettin
         control_plane_url=_clean(env.get("AUTOGLM_CONTROL_PLANE_URL")),
         internal_token=internal_token,
         guarded_apps=parse_guarded_apps(env.get("AUTOGLM_GUARDED_APPS")),
+        action_guard_model=action_guard_model,
+        model_base_url=model_base_url,
+        model_api_key=model_api_key,
     )
 
 
@@ -688,6 +705,23 @@ def ask_user(
     return status == "approved"
 
 
+# An input the user already approved because the executor flagged it
+# (``message=`` on a Tap) is not asked about again by the action guard.
+INPUT_APPROVAL_SECONDS = 120.0
+_input_approvals: dict[tuple[str, str], float] = {}
+
+
+def mark_input_approved(device_id: str, context: str) -> None:
+    """The user approved the next input of this agent."""
+    _input_approvals[(device_id, context)] = time.monotonic() + INPUT_APPROVAL_SECONDS
+
+
+def take_input_approval(device_id: str, context: str) -> bool:
+    """Use up an approval for the next input; False if there is none (left)."""
+    expires = _input_approvals.pop((device_id, context), None)
+    return expires is not None and time.monotonic() < expires
+
+
 def managed_confirmation(device_id: str, context: str) -> Callable[[str], bool]:
     """Confirmation callback that asks the user through the control plane.
 
@@ -696,7 +730,10 @@ def managed_confirmation(device_id: str, context: str) -> Callable[[str], bool]:
     """
 
     def confirm(message: str) -> bool:
-        return ask_user(message, device_id=device_id, context=context)
+        allowed = ask_user(message, device_id=device_id, context=context)
+        if allowed:
+            mark_input_approved(device_id, context)
+        return allowed
 
     return confirm
 
