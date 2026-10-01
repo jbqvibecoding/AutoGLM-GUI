@@ -252,6 +252,43 @@ def _create_midscene_agent(
 register_agent("midscene", _create_midscene_agent)
 
 
+def _create_artemis_agent(
+    model_config: ModelConfig,
+    agent_config: AgentConfig,
+    agent_specific_config: AgentSpecificConfig,
+    device: DeviceProtocol,
+    takeover_callback: Callable[..., Any] | None = None,
+    confirmation_callback: Callable[..., Any] | None = None,
+) -> AsyncAgent:
+    """Create ArtemisAgent instance.
+
+    Hands goals to an Artemis server over its HTTP API. Artemis drives the
+    phone itself through the same adb server. Needs AUTOGLM_ARTEMIS_URL and
+    AUTOGLM_ARTEMIS_TOKEN (or ``artemis_url`` / ``artemis_token`` params).
+    """
+    from .artemis.async_agent import ArtemisAgent, artemis_endpoint
+
+    endpoint = artemis_endpoint(agent_specific_config)
+    if endpoint is None:
+        raise ValueError(
+            "Artemis executor is not configured: set AUTOGLM_ARTEMIS_URL and "
+            "AUTOGLM_ARTEMIS_TOKEN"
+        )
+    base_url, token = endpoint
+    return ArtemisAgent(  # type: ignore[return-value]
+        model_config=model_config,
+        agent_config=agent_config,
+        device=device,
+        base_url=base_url,
+        token=token,
+        takeover_callback=takeover_callback,
+        confirmation_callback=confirmation_callback,
+    )
+
+
+register_agent("artemis", _create_artemis_agent)
+
+
 def _create_qwen_agent(
     model_config: ModelConfig,
     agent_config: AgentConfig,
