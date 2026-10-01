@@ -138,6 +138,7 @@ def test_request_sends_context_and_waits_for_decision() -> None:
         "message": "确认支付",
         "device_id": "phone-1",
         "context": "chat:s1",
+        "kind": "action",
     }
     polls = [r for r in cp.requests if r.method == "GET"]
     assert len(polls) == 2

@@ -1,6 +1,7 @@
 """Device control utilities for Android automation."""
 
 import asyncio
+import re
 import subprocess
 
 from AutoGLM_GUI.adb.apps import APP_PACKAGES
@@ -34,6 +35,47 @@ def get_current_app(device_id: str | None = None) -> str:
                     return app_name
 
     return "System Home"
+
+
+# "u0 com.eg.android.AlipayGphone/com.alipay...LauncherActivity}" -> package
+_FOCUS_PACKAGE = re.compile(r"\b([A-Za-z][\w]*(?:\.[\w]+)+)/")
+
+
+def parse_focused_package(dumpsys_output: str) -> str | None:
+    """The foreground package from ``dumpsys window`` output.
+
+    Prefers ``mCurrentFocus`` (the focused window) over ``mFocusedApp``; a
+    focus line without an activity (e.g. ``NotificationShade``) is skipped.
+    """
+    found: dict[str, str] = {}
+    for line in dumpsys_output.splitlines():
+        for key in ("mCurrentFocus", "mFocusedApp"):
+            if key in line and key not in found:
+                match = _FOCUS_PACKAGE.search(line)
+                if match:
+                    found[key] = match.group(1)
+    return found.get("mCurrentFocus") or found.get("mFocusedApp")
+
+
+def get_current_package(device_id: str | None = None) -> str | None:
+    """Package name of the foreground app, or None if it cannot be told."""
+    adb_prefix = build_adb_command(device_id)
+    with trace_span("adb.get_current_package", attrs={"device_id": device_id}):
+        result = subprocess.run(
+            adb_prefix + ["shell", "dumpsys", "window"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=True,
+        )
+    return parse_focused_package(result.stdout or "")
+
+
+async def get_current_package_async(device_id: str | None = None) -> str | None:
+    adb_prefix = build_adb_command(device_id)
+    with trace_span("adb.get_current_package", attrs={"device_id": device_id}):
+        result = await run_cmd_silently(adb_prefix + ["shell", "dumpsys", "window"])
+    return parse_focused_package(result.stdout or "")
 
 
 async def get_current_app_async(device_id: str | None = None) -> str:

@@ -18,6 +18,7 @@ from AutoGLM_GUI.exceptions import (
     AgentNotInitializedError,
     DeviceBusyError,
 )
+from AutoGLM_GUI.devices.guarded_device import agent_context, guard_device
 from AutoGLM_GUI.logger import logger
 from AutoGLM_GUI.managed import (
     ensure_device_awake,
@@ -273,6 +274,11 @@ class PhoneAgentManager:
                 ):
                     device = device_manager.get_async_device_protocol(actual_device_id)
 
+            # 托管模式：在受保护 App 里操作前需用户允许，并记录最近截图供审批展示
+            device = guard_device(
+                device, agent_key=device_id, device_id=actual_device_id
+            )
+
             with trace_span(
                 "agent_manager.create_agent",
                 attrs={"device_id": device_id, "agent_type": agent_type},
@@ -446,12 +452,7 @@ class PhoneAgentManager:
         confirmation_callback: Callable[[str], bool] = noop_confirmation
         if is_managed_mode():
             # 托管模式：敏感操作需要用户在控制面批准，接管请求会通知用户
-            # agent_key 是 device_id 或 device_id:context（device_id 本身可能含冒号）
-            context = (
-                agent_key.removeprefix(f"{actual_device_id}:")
-                if agent_key != actual_device_id
-                else "default"
-            )
+            context = agent_context(agent_key, actual_device_id)
             takeover_callback = managed_takeover(actual_device_id, context)
             confirmation_callback = managed_confirmation(actual_device_id, context)
 
