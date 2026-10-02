@@ -1,4 +1,11 @@
-"""Scheduled task manager with APScheduler."""
+"""Scheduled task manager with APScheduler.
+
+In managed mode the phone sleeps when idle and a cold boot takes minutes, so
+the manager also wakes it ahead of time: a few minutes before a task is due
+(``schedule_prewarm_seconds``) it asks the control plane to wake the phone,
+and while a task is that close the runtime reports itself busy, which keeps
+the phone awake until the task starts (see ``due_soon``).
+"""
 
 from __future__ import annotations
 
@@ -12,9 +19,15 @@ from uuid import uuid4
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 from AutoGLM_GUI.logger import logger
 from AutoGLM_GUI.models.scheduled_task import ScheduledTask
+from AutoGLM_GUI.trace import trace_span
+
+PREWARM_JOB_ID = "scheduler-prewarm"
+PREWARM_NOW_JOB_ID = "scheduler-prewarm-now"
+PREWARM_CHECK_SECONDS = 30
 
 if TYPE_CHECKING:
     pass
@@ -44,13 +57,35 @@ class SchedulerManager:
         self._scheduler = AsyncIOScheduler()
         self._tasks: dict[str, ScheduledTask] = {}
         self._file_mtime: float | None = None
+        # Seconds ahead of a run to wake the phone; 0 outside managed mode.
+        self._prewarm_seconds = 0.0
+        # task id -> the run already warmed up for, so each run wakes once.
+        self._prewarmed: dict[str, datetime] = {}
 
-    async def start(self) -> None:
+    async def start(self, prewarm_seconds: float | None = None) -> None:
+        if prewarm_seconds is None:
+            from AutoGLM_GUI.managed import load_managed_settings
+
+            settings = load_managed_settings()
+            prewarm_seconds = (
+                settings.schedule_prewarm_seconds if settings.enabled else 0
+            )
+        self._prewarm_seconds = max(0.0, prewarm_seconds)
         self._load_tasks()
         for task in self._tasks.values():
             if task.enabled:
                 self._add_job(task)
+        if self._prewarm_seconds:
+            self._scheduler.add_job(
+                self.prewarm_once,
+                trigger=IntervalTrigger(seconds=PREWARM_CHECK_SECONDS),
+                id=PREWARM_JOB_ID,
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+            )
         self._scheduler.start()
+        self._prewarm_soon()
         logger.info(f"SchedulerManager started with {len(self._tasks)} task(s)")
 
     async def shutdown(self) -> None:
@@ -81,6 +116,7 @@ class SchedulerManager:
 
         if enabled:
             self._add_job(task)
+            self._prewarm_soon()
 
         logger.info(f"Created scheduled task: {name} (id={task.id})")
         return task
@@ -107,6 +143,8 @@ class SchedulerManager:
         elif task.enabled and old_cron != task.cron_expression:
             self._remove_job(task_id)
             self._add_job(task)
+        if task.enabled:
+            self._prewarm_soon()
 
         logger.info(f"Updated scheduled task: {task.name} (id={task_id})")
         return task
@@ -141,6 +179,7 @@ class SchedulerManager:
 
         if enabled:
             self._add_job(task)
+            self._prewarm_soon()
         else:
             self._remove_job(task_id)
 
@@ -152,6 +191,70 @@ class SchedulerManager:
         if job and job.next_run_time:
             return job.next_run_time.replace(tzinfo=None)
         return None
+
+    # ------------------------------------------------------------- warm-up
+
+    def _upcoming_runs(
+        self, seconds: float, now: datetime | None = None
+    ) -> list[tuple[ScheduledTask, datetime]]:
+        """Enabled tasks whose next run is due within ``seconds``."""
+        now = now or datetime.now(tz=timezone.utc)
+        due = []
+        for task in self._tasks.values():
+            if not task.enabled:
+                continue
+            job = self._scheduler.get_job(task.id)
+            next_run = job.next_run_time if job else None
+            if (
+                next_run is not None
+                and 0 <= (next_run - now).total_seconds() <= seconds
+            ):
+                due.append((task, next_run))
+        return due
+
+    def due_within(self, seconds: float, now: datetime | None = None) -> bool:
+        return bool(self._upcoming_runs(seconds, now))
+
+    def due_soon(self) -> bool:
+        """A task is due within the warm-up lead: keep the phone awake for it."""
+        return bool(self._prewarm_seconds) and self.due_within(self._prewarm_seconds)
+
+    async def prewarm_once(self, now: datetime | None = None) -> bool:
+        """Wake the phone for runs due within the lead; once per run.
+
+        Returns whether a wake was requested. Failures are only logged: each
+        run wakes the phone again when it starts.
+        """
+        if not self._prewarm_seconds:
+            return False
+        fresh = [
+            (task, run)
+            for task, run in self._upcoming_runs(self._prewarm_seconds, now)
+            if self._prewarmed.get(task.id) != run
+        ]
+        if not fresh:
+            return False
+        # Claimed before waking, so an overlapping sweep does not wake again.
+        for task, run in fresh:
+            self._prewarmed[task.id] = run
+        from AutoGLM_GUI.managed import ensure_device_awake
+
+        names = [task.name for task, _ in fresh]
+        logger.info(f"[Scheduler] Waking the phone ahead of: {', '.join(names)}")
+        with trace_span("scheduler.prewarm", attrs={"tasks": names}):
+            try:
+                await ensure_device_awake()
+            except Exception:
+                logger.exception("[Scheduler] Wake-up ahead of a scheduled task failed")
+        return True
+
+    def _prewarm_soon(self) -> None:
+        """Check right away (e.g. a task just created for two minutes from now)."""
+        if not self._prewarm_seconds or not self._scheduler.running:
+            return
+        self._scheduler.add_job(
+            self.prewarm_once, id=PREWARM_NOW_JOB_ID, replace_existing=True
+        )
 
     def _add_job(self, task: ScheduledTask) -> None:
         try:
@@ -180,6 +283,7 @@ class SchedulerManager:
             logger.error(f"Failed to add job for task {task.name}: {e}")
 
     def _remove_job(self, task_id: str) -> None:
+        self._prewarmed.pop(task_id, None)
         try:
             if self._scheduler.get_job(task_id):
                 self._scheduler.remove_job(task_id)

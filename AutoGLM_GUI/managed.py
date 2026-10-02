@@ -63,6 +63,9 @@ DEFAULT_WAKE_TIMEOUT = 240.0
 # wake counts as activity, so a wake is still valid for a short while.
 WAKE_DEBOUNCE_SECONDS = 30.0
 HEARTBEAT_INTERVAL_SECONDS = 30.0
+# Wake the phone this long before a scheduled task is due, so the task does
+# not start with a cold boot (see scheduler_manager.prewarm_once).
+DEFAULT_SCHEDULE_PREWARM_SECONDS = 180.0
 
 # Each approval long-poll waits at most this long for the user's decision.
 APPROVAL_POLL_SECONDS = 25.0
@@ -90,6 +93,8 @@ class ManagedSettings:
     action_guard_model: str | None = None
     model_base_url: str | None = None
     model_api_key: str | None = None
+    # 0 turns the wake-up before scheduled tasks off.
+    schedule_prewarm_seconds: float = DEFAULT_SCHEDULE_PREWARM_SECONDS
 
 
 def _clean(value: str | None) -> str | None:
@@ -148,6 +153,19 @@ def load_managed_settings(env: Mapping[str, str] | None = None) -> ManagedSettin
             "AUTOGLM_API_KEY"
         )
 
+    raw_prewarm = _clean(env.get("AUTOGLM_SCHEDULE_PREWARM_SECONDS"))
+    try:
+        schedule_prewarm_seconds = (
+            float(raw_prewarm) if raw_prewarm else DEFAULT_SCHEDULE_PREWARM_SECONDS
+        )
+    except ValueError:
+        schedule_prewarm_seconds = -1.0
+    if not 0 <= schedule_prewarm_seconds < float("inf"):
+        raise ValueError(
+            "Managed mode: AUTOGLM_SCHEDULE_PREWARM_SECONDS must be a number of "
+            f"seconds (0 to turn it off), got {raw_prewarm!r}"
+        )
+
     return ManagedSettings(
         enabled=True,
         device_serial=device_serial,
@@ -160,6 +178,7 @@ def load_managed_settings(env: Mapping[str, str] | None = None) -> ManagedSettin
         action_guard_model=action_guard_model,
         model_base_url=model_base_url,
         model_api_key=model_api_key,
+        schedule_prewarm_seconds=schedule_prewarm_seconds,
     )
 
 

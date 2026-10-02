@@ -138,6 +138,17 @@ def _get_static_dir() -> Path | None:
     return None
 
 
+async def managed_busy() -> bool:
+    """Whether the managed phone should stay awake: an agent is working, or a
+    scheduled task is due within the warm-up lead (see scheduler_manager)."""
+    from AutoGLM_GUI.phone_agent_manager import PhoneAgentManager
+    from AutoGLM_GUI.scheduler_manager import scheduler_manager
+
+    if await PhoneAgentManager.get_instance().has_busy_agent_async():
+        return True
+    return scheduler_manager.due_soon()
+
+
 def create_app() -> FastAPI:
     """Build the FastAPI app with routers and static assets."""
 
@@ -168,7 +179,6 @@ def create_app() -> FastAPI:
         asyncio.create_task(qr_pairing_manager.cleanup_expired_sessions())
 
         from AutoGLM_GUI.device_manager import DeviceManager
-        from AutoGLM_GUI.phone_agent_manager import PhoneAgentManager
         from AutoGLM_GUI.scheduler_manager import scheduler_manager
         from AutoGLM_GUI.socketio_server import active_stream_count
         from AutoGLM_GUI.task_manager import task_manager
@@ -193,10 +203,7 @@ def create_app() -> FastAPI:
             )
             if managed_runtime is not None:
                 managed_heartbeat_task = asyncio.create_task(
-                    managed_runtime.heartbeat_loop(
-                        PhoneAgentManager.get_instance().has_busy_agent_async,
-                        active_stream_count,
-                    )
+                    managed_runtime.heartbeat_loop(managed_busy, active_stream_count)
                 )
 
         await task_manager.start()
